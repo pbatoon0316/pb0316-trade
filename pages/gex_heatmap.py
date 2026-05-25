@@ -146,6 +146,49 @@ def load_option_chains(ticker, expiries, spot, snapshot_time):
     return raw_options_df, failed_expiries
 
 
+def load_missing_expiries(expiries, loading_message):
+    loaded_expiries = st.session_state.get("loaded_expiries", [])
+    missing_expiries = [expiry for expiry in expiries if expiry not in loaded_expiries]
+
+    if not missing_expiries:
+        st.info("All requested expiries are already loaded.")
+        return
+
+    with st.spinner(loading_message):
+        new_df, failed_expiries = load_option_chains(
+            st.session_state["ticker"],
+            missing_expiries,
+            st.session_state["spot"],
+            st.session_state["snapshot_time"],
+        )
+
+        if not new_df.empty:
+            current_df = st.session_state["raw_options_df"]
+            st.session_state["raw_options_df"] = pd.concat(
+                [current_df, new_df],
+                ignore_index=True,
+            )
+
+        successful_expiries = [
+            expiry for expiry in missing_expiries if expiry not in failed_expiries
+        ]
+        st.session_state["loaded_expiries"] = loaded_expiries + successful_expiries
+
+        if failed_expiries:
+            st.warning(f"Some expiries returned no data: {', '.join(failed_expiries)}")
+        if successful_expiries:
+            st.success(f"Loaded: {', '.join(successful_expiries)}")
+
+
+def get_this_year_expiries(expiries):
+    current_year = date.today().year
+    return [
+        expiry
+        for expiry in expiries
+        if datetime.strptime(expiry, "%Y-%m-%d").date().year == current_year
+    ]
+
+
 def calculate_dte(expiry):
     expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
     return (expiry_date - date.today()).days
@@ -302,6 +345,10 @@ def make_heatmap_fig(heatmap_df, metric, color_scale_mode, spot, ticker, snapsho
     abs_values = np.abs(values)
     if color_scale_mode == "90th percentile":
         zmax = np.nanpercentile(abs_values, 90)
+    elif color_scale_mode == "95th Percentile":
+        zmax = np.nanpercentile(abs_values, 95)
+    elif color_scale_mode == "99th Percentile":
+        zmax = np.nanpercentile(abs_values, 99)
     else:
         zmax = np.nanmax(abs_values)
 
@@ -566,39 +613,20 @@ def main():
             )
             st.session_state["selected_expiries"] = selected_expiries
 
-            if st.button("Load Selected Expiries"):
-                loaded_expiries = st.session_state.get("loaded_expiries", [])
-                missing_expiries = [
-                    expiry for expiry in selected_expiries if expiry not in loaded_expiries
-                ]
+            load_col, year_col = st.columns(2)
+            if load_col.button("Load Selected Expiries"):
+                load_missing_expiries(selected_expiries, "Loading selected expiries...")
 
-                if not missing_expiries:
-                    st.info("All selected expiries are already loaded.")
+            if year_col.button("Load This Year"):
+                this_year_expiries = get_this_year_expiries(available_expiries)
+                if not this_year_expiries:
+                    st.info(f"No expiries found in {date.today().year}.")
                 else:
-                    with st.spinner("Loading selected expiries..."):
-                        new_df, failed_expiries = load_option_chains(
-                            st.session_state["ticker"],
-                            missing_expiries,
-                            st.session_state["spot"],
-                            st.session_state["snapshot_time"],
-                        )
+                    st.session_state["selected_expiries"] = this_year_expiries
+                    load_missing_expiries(this_year_expiries, "Loading this year's expiries...")
+                    st.rerun()
 
-                        if not new_df.empty:
-                            current_df = st.session_state["raw_options_df"]
-                            st.session_state["raw_options_df"] = pd.concat(
-                                [current_df, new_df],
-                                ignore_index=True,
-                            )
-
-                        successful_expiries = [
-                            expiry for expiry in missing_expiries if expiry not in failed_expiries
-                        ]
-                        st.session_state["loaded_expiries"] = loaded_expiries + successful_expiries
-
-                        if failed_expiries:
-                            st.warning(f"Some expiries returned no data: {', '.join(failed_expiries)}")
-                        if successful_expiries:
-                            st.success(f"Loaded: {', '.join(successful_expiries)}")
+        recompute_clicked = st.button("Recompute / Redraw Heatmap")
 
         spot = st.session_state.get("spot")
         if spot:
@@ -621,11 +649,9 @@ def main():
 
         color_scale_mode = st.selectbox(
             "Color Scale Mode",
-            options=["Auto max", "90th percentile"],
+            options=["Auto max", "90th percentile", "95th Percentile", "99th Percentile"],
             index=0,
         )
-
-        recompute_clicked = st.button("Recompute / Redraw Heatmap")
 
     if recompute_clicked:
         raw_options_df = st.session_state.get("raw_options_df")
@@ -643,16 +669,7 @@ def main():
                     st.session_state["spot"],
                     st.session_state["risk_free_rate"],
                 )
-                heatmap_df = build_listed_strikes_heatmap_matrix(
-                    gex_df,
-                    selected_expiries,
-                    metric,
-                    lower_strike,
-                    upper_strike,
-                )
-
                 st.session_state["gex_df"] = gex_df
-                st.session_state["heatmap_df"] = heatmap_df
 
     if "raw_options_df" not in st.session_state:
         st.info("Enter a ticker to begin.")
@@ -660,8 +677,22 @@ def main():
 
     show_snapshot_metrics()
 
-    heatmap_df = st.session_state.get("heatmap_df")
-    if heatmap_df is not None:
+    gex_df = st.session_state.get("gex_df")
+    if (
+        gex_df is not None
+        and not gex_df.empty
+        and lower_strike is not None
+        and upper_strike is not None
+    ):
+        heatmap_df = build_listed_strikes_heatmap_matrix(
+            gex_df,
+            st.session_state["selected_expiries"],
+            metric,
+            lower_strike,
+            upper_strike,
+        )
+        st.session_state["heatmap_df"] = heatmap_df
+
         fig, warning_message = make_heatmap_fig(
             heatmap_df,
             metric,
@@ -675,13 +706,13 @@ def main():
             st.warning(warning_message)
         else:
             total_gex_fig = make_total_gex_by_strike_fig(
-                st.session_state["gex_df"],
+                gex_df,
                 st.session_state["selected_expiries"],
                 lower_strike,
                 upper_strike,
                 st.session_state["spot"],
             )
-            heatmap_col, gex_col = st.columns([3, 1])
+            heatmap_col, gex_col = st.columns([3, 2])
 
             with heatmap_col:
                 st.plotly_chart(fig, use_container_width=True)
