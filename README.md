@@ -1,23 +1,36 @@
-# Options GEX Heatmap - Listed Strikes MVP
+# Trading Tools for pb0316
 
-This Streamlit app downloads option chain data with `yfinance`, estimates Black-Scholes gamma, and displays gamma exposure across option expirations.
-
-The MVP implements **Listed Strikes Only** mode. It preserves the actual listed strikes for each expiration. Missing heatmap cells mean that strike is not listed for that expiry, not zero GEX.
+This Streamlit app contains a small collection of market screeners and options analysis tools. Launch the app from `home.py` and choose a tool from the Streamlit sidebar.
 
 ## Run Locally
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run home.py
 ```
 
-## MVP Limitations
+## Pages
 
-- Uses `yfinance`, so data quality and availability may vary.
-- Greeks are estimated from Black-Scholes using `yfinance` implied volatility.
-- Dividends are ignored.
-- Risk-free rate is approximated from the `yfinance` `SR3=F` futures price using `(100 - price) / 100`.
-- `SR3=F` is used as a simple short-rate proxy, not an expiry-matched rate curve.
-- Listed Strikes Only mode preserves actual listed strikes.
-- Missing heatmap cells mean no listed strike for that expiry, not zero GEX.
-- Not financial advice.
+### Home
+
+The home page is a simple entry point for the app. Use the sidebar to navigate to the available trading tools.
+
+### Options GEX Heatmap
+
+Downloads option chain data with `yfinance`, estimates Black-Scholes gamma exposure, and visualizes GEX across listed strikes and expirations. The page includes controls for expirations, color scaling, and GEX metric selection.
+
+### RSI Trend Screener
+
+Screens a Nasdaq ticker universe for weekly RSI trend setups using price, volume, moving averages, and RSI conditions. Results can be filtered by price and sector, then reviewed with embedded TradingView charts.
+
+### Weekly Consolidation Screener
+
+Finds weekly squeeze/consolidation setups using Bollinger Band and Keltner Channel logic, with trend confirmation from moving averages and momentum. The sidebar filters results by price and sector and displays matching weekly charts.
+
+### Volatility-Momentum Surge
+
+Screens for recent volatility-momentum breakouts or breakdowns using price-change Z-score, volume Z-score, moving-average trend structure, volume average, and sector filters. Results are shown in the sidebar and charted in a three-column TradingView grid.
+
+## Notes
+
+Data is downloaded from Yahoo Finance through `yfinance`, so availability, throttling, and data quality may vary. These tools are for research workflows and are not financial advice.
