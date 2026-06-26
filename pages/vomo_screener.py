@@ -59,7 +59,7 @@ def download_data():
                 interval='1d',
                 auto_adjust=True,
                 progress=False,
-                threads=False,
+                threads=True,
             )
         except Exception:
             continue
