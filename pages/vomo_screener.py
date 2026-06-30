@@ -2,7 +2,7 @@ import pandas as pd
 import yfinance as yf
 import warnings
 import streamlit as st
-from urllib.parse import quote
+import streamlit.components.v1 as components
 
 
 ######################
@@ -75,10 +75,12 @@ def download_data():
     data = data.loc[:, ~data.columns.duplicated()]
     return data
 
-def scanner(data, threshold=2, lookback_days=20, screen_direction='Breakouts'):
+def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
     columns = [
         'Signal',
         'ticker',
+        'Current Date',
+        'Current Close',
         '%change_zscore',
         'volume_zscore',
         'volume_average',
@@ -147,32 +149,47 @@ def scanner(data, threshold=2, lookback_days=20, screen_direction='Breakouts'):
 
         df = df[['Signal','ticker','Close','%change_zscore','volume_zscore','volume_average','Volume(M)','SMA20','SMA50','SMA100','SMA200']]
         recent_df = df[df.index.isin(screen_dates)]
+        current = df.dropna(subset=['SMA20', 'SMA50', 'SMA100', 'SMA200']).iloc[-1]
         if screen_direction == 'Breakdowns':
-            signal_filter = (
+            current_trend = (
+                (current['Close'] < current['SMA20'])
+                & (current['SMA20'] < current['SMA50'])
+                & (current['SMA50'] < current['SMA100'])
+                & (current['SMA100'] < current['SMA200'])
+            )
+            surge_filter = (
                 (recent_df['%change_zscore'] < -threshold)
                 & (recent_df['volume_zscore'] > threshold)
-                & (recent_df['Close'] < recent_df['SMA20'])
-                & (recent_df['SMA20'] < recent_df['SMA50'])
-                & (recent_df['SMA50'] < recent_df['SMA100'])
-                & (recent_df['SMA100'] < recent_df['SMA200'])
             )
         else:
-            signal_filter = (
+            current_trend = (
+                (current['Close'] > current['SMA20'])
+                & (current['SMA20'] > current['SMA50'])
+                & (current['SMA50'] > current['SMA100'])
+                & (current['SMA100'] > current['SMA200'])
+            )
+            surge_filter = (
                 (recent_df['%change_zscore'] > threshold)
                 & (recent_df['volume_zscore'] > threshold)
-                & (recent_df['Close'] > recent_df['SMA20'])
-                & (recent_df['SMA20'] > recent_df['SMA50'])
-                & (recent_df['SMA50'] > recent_df['SMA100'])
-                & (recent_df['SMA100'] > recent_df['SMA200'])
             )
 
-        breakout_df = recent_df[
-            signal_filter
-        ].dropna(subset=['%change_zscore', 'volume_zscore', 'SMA20', 'SMA50', 'SMA100', 'SMA200'])
+        if not current_trend:
+            continue
 
-        breakout_df = breakout_df.drop(columns=['Close'])
+        breakout_df = recent_df[
+            surge_filter
+        ].dropna(subset=['%change_zscore', 'volume_zscore'])
 
         if not breakout_df.empty:
+            breakout_df = breakout_df.sort_index().iloc[[-1]].copy()
+            breakout_df['Current Date'] = current.name
+            breakout_df['Current Close'] = current['Close']
+            breakout_df['SMA20'] = current['SMA20']
+            breakout_df['SMA50'] = current['SMA50']
+            breakout_df['SMA100'] = current['SMA100']
+            breakout_df['SMA200'] = current['SMA200']
+            breakout_df = breakout_df.drop(columns=['Close'])
+
             breakout_rows.append(breakout_df)
 
     if not breakout_rows:
@@ -187,7 +204,7 @@ def scanner(data, threshold=2, lookback_days=20, screen_direction='Breakouts'):
 
 CHART_HEIGHT = 320
 
-def plot_ticker_iframe_src(ticker, metadata, breakouts):
+def plot_ticker_html(ticker, metadata, breakouts):
 
     ticker_metadata = metadata[metadata['Symbol'].astype(str).str.replace('/', '-', regex=False) == ticker]
     company_sector = 'Unknown'
@@ -200,31 +217,6 @@ def plot_ticker_iframe_src(ticker, metadata, breakouts):
     st.markdown(f'''{round(avg_vol,2)}M - {ticker} - {company_sector} [[Finviz]](https://finviz.com/quote.ashx?t={ticker}&p=d) [[Profitviz]](https://profitviz.com/{ticker})''')
     
     fig_html = f'''
-    <!doctype html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <style>
-            html,
-            body {{
-                width: 100%;
-                height: {CHART_HEIGHT}px;
-                margin: 0;
-                padding: 0;
-                overflow: hidden;
-                background: #ffffff;
-            }}
-            .tradingview-widget-container,
-            .tradingview-widget-container__widget {{
-                width: 100%;
-                height: {CHART_HEIGHT}px;
-                margin: 0;
-                padding: 0;
-                overflow: hidden;
-            }}
-        </style>
-    </head>
-    <body>
     <!-- TradingView Widget BEGIN -->
     <div class="tradingview-widget-container">
         <div class="tradingview-widget-container__widget"></div>
@@ -253,10 +245,8 @@ def plot_ticker_iframe_src(ticker, metadata, breakouts):
         </script>
     </div>
     <!-- TradingView Widget END -->
-    </body>
-    </html>
     '''
-    return f'data:text/html;charset=utf-8,{quote(fig_html)}'
+    return fig_html
 
 def add_metadata_columns(breakouts, metadata):
     if breakouts.empty:
@@ -274,6 +264,8 @@ def prepare_breakouts_for_display(breakouts, metadata, min_volume_average, secto
         'Name',
         'Sector',
         'Industry',
+        'Current Date',
+        'Current Close',
         '%change_zscore',
         'volume_zscore',
         'volume_average',
@@ -290,7 +282,7 @@ def prepare_breakouts_for_display(breakouts, metadata, min_volume_average, secto
     if 'Date' not in display_breakouts.columns:
         display_breakouts = display_breakouts.rename(columns={display_breakouts.columns[0]: 'Date'})
 
-    display_breakouts = display_breakouts.sort_values(by=['Date','volume_average'], ascending=False)
+    display_breakouts = display_breakouts.sort_values(by=['volume_average', 'Date'], ascending=False)
     display_breakouts = display_breakouts.drop_duplicates(subset=['Date', 'ticker'])
     display_breakouts = add_metadata_columns(display_breakouts, metadata)
     display_breakouts = display_breakouts[display_breakouts['volume_average'] > min_volume_average]
@@ -311,11 +303,17 @@ def get_sector_options(raw_breakouts, metadata):
 ######################
 
 empty_breakouts = pd.DataFrame(
-    columns=['Signal', 'ticker', '%change_zscore', 'volume_zscore', 'volume_average', 'Volume(M)', 'SMA20', 'SMA50', 'SMA100', 'SMA200']
+    columns=['Signal', 'ticker', 'Current Date', 'Current Close', '%change_zscore', 'volume_zscore', 'volume_average', 'Volume(M)', 'SMA20', 'SMA50', 'SMA100', 'SMA200']
 ).rename_axis('Date')
 raw_breakouts_by_signal = st.session_state.get('raw_breakouts_by_signal', {})
 legacy_raw_breakouts = st.session_state.get('raw_breakouts', empty_breakouts)
-if not legacy_raw_breakouts.empty and 'Breakouts' not in raw_breakouts_by_signal:
+if any(
+    not cached_breakouts.empty and 'Current Date' not in cached_breakouts.columns
+    for cached_breakouts in raw_breakouts_by_signal.values()
+):
+    raw_breakouts_by_signal = {}
+    st.session_state.raw_breakouts_by_signal = raw_breakouts_by_signal
+if not legacy_raw_breakouts.empty and 'Current Date' in legacy_raw_breakouts.columns and 'Breakouts' not in raw_breakouts_by_signal:
     raw_breakouts_by_signal['Breakouts'] = legacy_raw_breakouts
 metadata = download_metadata()
 st.session_state.metadata = metadata
@@ -387,7 +385,10 @@ chart_columns = st.columns(3)
 for i, ticker in enumerate(visible_tickers):
     with chart_columns[i % 3]:
         try:
-            fig = plot_ticker_iframe_src(ticker, metadata, breakouts)
-            st.iframe(fig, height=CHART_HEIGHT)
+            fig = plot_ticker_html(ticker, metadata, breakouts)
+            components.html(fig, height=CHART_HEIGHT)
         except:
             st.markdown(f'{ticker} - [[Finviz]](https://finviz.com/quote.ashx?t={ticker}&p=d) [[Profitviz]](https://profitviz.com/{ticker})')
+
+if chart_tickers:
+    st.code(','.join(chart_tickers), language='text')
