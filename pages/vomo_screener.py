@@ -75,7 +75,7 @@ def download_data():
     data = data.loc[:, ~data.columns.duplicated()]
     return data
 
-def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
+def scanner(data, threshold=2, lookback_days=20, screen_direction='Breakouts'):
     columns = [
         'Signal',
         'ticker',
@@ -85,10 +85,13 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
         'volume_zscore',
         'volume_average',
         'Volume(M)',
-        'SMA20',
-        'SMA50',
-        'SMA100',
-        'SMA200',
+        'EMA8',
+        'EMA20',
+        'EMA50',
+        'EMA100',
+        'EMA200',
+        'BB8_Lower',
+        'BB8_Upper',
     ]
     if data.empty or not isinstance(data.columns, pd.MultiIndex):
         empty_breakouts = pd.DataFrame(columns=columns)
@@ -98,7 +101,7 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
     tickers = list(data.columns.get_level_values(1).unique())
     breakout_rows = []
     period = 20
-    longest_sma_period = 200
+    longest_ema_period = 200
     dates = pd.Index(data.index).dropna().sort_values().unique()
     if len(dates) == 0:
         empty_breakouts = pd.DataFrame(columns=columns)
@@ -124,15 +127,19 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
             continue
 
         df = df[['Close', 'Volume']].dropna()
-        if len(df) < longest_sma_period:
+        if len(df) < longest_ema_period:
             continue
 
         df['Signal'] = screen_direction
         df['ticker'] = ticker
-        df['SMA20'] = df['Close'].rolling(20, min_periods=20).mean()
-        df['SMA50'] = df['Close'].rolling(50, min_periods=50).mean()
-        df['SMA100'] = df['Close'].rolling(100, min_periods=100).mean()
-        df['SMA200'] = df['Close'].rolling(200, min_periods=200).mean()
+        df['EMA8'] = df['Close'].ewm(span=8, adjust=False, min_periods=8).mean()
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False, min_periods=20).mean()
+        df['EMA50'] = df['Close'].ewm(span=50, adjust=False, min_periods=50).mean()
+        df['EMA100'] = df['Close'].ewm(span=100, adjust=False, min_periods=100).mean()
+        df['EMA200'] = df['Close'].ewm(span=200, adjust=False, min_periods=200).mean()
+        bb8_std = df['Close'].rolling(8, min_periods=8).std()
+        df['BB8_Lower'] = df['EMA8'] - (1.5 * bb8_std)
+        df['BB8_Upper'] = df['EMA8'] + (1.5 * bb8_std)
 
         df['%change'] = df['Close'].pct_change()
         previous_changes = df['%change'].shift(1)
@@ -147,15 +154,20 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
         df['volume_average'] = volume_mean
         df['volume_zscore'] = (df['Volume(M)'] - volume_mean) / volume_std
 
-        df = df[['Signal','ticker','Close','%change_zscore','volume_zscore','volume_average','Volume(M)','SMA20','SMA50','SMA100','SMA200']]
+        df = df[['Signal','ticker','Close','%change_zscore','volume_zscore','volume_average','Volume(M)','EMA8','EMA20','EMA50','EMA100','EMA200','BB8_Lower','BB8_Upper']]
         recent_df = df[df.index.isin(screen_dates)]
-        current = df.dropna(subset=['SMA20', 'SMA50', 'SMA100', 'SMA200']).iloc[-1]
+        current_df = df.dropna(subset=['EMA8', 'EMA20', 'EMA50', 'EMA100', 'EMA200', 'BB8_Lower', 'BB8_Upper'])
+        if current_df.empty:
+            continue
+        current = current_df.iloc[-1]
         if screen_direction == 'Breakdowns':
             current_trend = (
-                (current['Close'] < current['SMA20'])
-                & (current['SMA20'] < current['SMA50'])
-                & (current['SMA50'] < current['SMA100'])
-                & (current['SMA100'] < current['SMA200'])
+                (current['EMA8'] < current['EMA20'])
+                & (current['EMA20'] < current['EMA50'])
+                & (current['EMA50'] < current['EMA100'])
+                & (current['EMA100'] < current['EMA200'])
+                & (current['BB8_Lower'] <= current['EMA20'])
+                & (current['EMA20'] <= current['BB8_Upper'])
             )
             surge_filter = (
                 (recent_df['%change_zscore'] < -threshold)
@@ -163,10 +175,12 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
             )
         else:
             current_trend = (
-                (current['Close'] > current['SMA20'])
-                & (current['SMA20'] > current['SMA50'])
-                & (current['SMA50'] > current['SMA100'])
-                & (current['SMA100'] > current['SMA200'])
+                (current['EMA8'] > current['EMA20'])
+                & (current['EMA20'] > current['EMA50'])
+                & (current['EMA50'] > current['EMA100'])
+                & (current['EMA100'] > current['EMA200'])
+                & (current['BB8_Lower'] <= current['EMA20'])
+                & (current['EMA20'] <= current['BB8_Upper'])
             )
             surge_filter = (
                 (recent_df['%change_zscore'] > threshold)
@@ -184,10 +198,13 @@ def scanner(data, threshold=2, lookback_days=10, screen_direction='Breakouts'):
             breakout_df = breakout_df.sort_index().iloc[[-1]].copy()
             breakout_df['Current Date'] = current.name
             breakout_df['Current Close'] = current['Close']
-            breakout_df['SMA20'] = current['SMA20']
-            breakout_df['SMA50'] = current['SMA50']
-            breakout_df['SMA100'] = current['SMA100']
-            breakout_df['SMA200'] = current['SMA200']
+            breakout_df['EMA8'] = current['EMA8']
+            breakout_df['EMA20'] = current['EMA20']
+            breakout_df['EMA50'] = current['EMA50']
+            breakout_df['EMA100'] = current['EMA100']
+            breakout_df['EMA200'] = current['EMA200']
+            breakout_df['BB8_Lower'] = current['BB8_Lower']
+            breakout_df['BB8_Upper'] = current['BB8_Upper']
             breakout_df = breakout_df.drop(columns=['Close'])
 
             breakout_rows.append(breakout_df)
@@ -254,7 +271,8 @@ def add_metadata_columns(breakouts, metadata):
 
     metadata_lookup = metadata.copy()
     metadata_lookup['ticker'] = metadata_lookup['Symbol'].astype(str).str.replace('/', '-', regex=False)
-    metadata_lookup = metadata_lookup[['ticker', 'Name', 'Sector', 'Industry']]
+    metadata_lookup['Market Cap'] = pd.to_numeric(metadata_lookup['Market Cap'], errors='coerce')
+    metadata_lookup = metadata_lookup[['ticker', 'Name', 'Sector', 'Industry', 'Market Cap']]
     return breakouts.merge(metadata_lookup, how='left', on='ticker')
 
 def prepare_breakouts_for_display(breakouts, metadata, min_volume_average, sector_filter):
@@ -264,16 +282,20 @@ def prepare_breakouts_for_display(breakouts, metadata, min_volume_average, secto
         'Name',
         'Sector',
         'Industry',
+        'Market Cap',
         'Current Date',
         'Current Close',
         '%change_zscore',
         'volume_zscore',
         'volume_average',
         'Volume(M)',
-        'SMA20',
-        'SMA50',
-        'SMA100',
-        'SMA200',
+        'EMA8',
+        'EMA20',
+        'EMA50',
+        'EMA100',
+        'EMA200',
+        'BB8_Lower',
+        'BB8_Upper',
     ]
     if breakouts.empty:
         return pd.DataFrame(columns=columns).rename_axis('Date')
@@ -282,13 +304,18 @@ def prepare_breakouts_for_display(breakouts, metadata, min_volume_average, secto
     if 'Date' not in display_breakouts.columns:
         display_breakouts = display_breakouts.rename(columns={display_breakouts.columns[0]: 'Date'})
 
-    display_breakouts = display_breakouts.sort_values(by=['volume_average', 'Date'], ascending=False)
+    display_breakouts = display_breakouts.sort_values(by=['Date'], ascending=False)
     display_breakouts = display_breakouts.drop_duplicates(subset=['Date', 'ticker'])
     display_breakouts = add_metadata_columns(display_breakouts, metadata)
     display_breakouts = display_breakouts[display_breakouts['volume_average'] > min_volume_average]
     if sector_filter != 'All':
         display_breakouts = display_breakouts[display_breakouts['Sector'] == sector_filter]
 
+    display_breakouts = display_breakouts.sort_values(
+        by=['Market Cap', 'volume_average', 'Date'],
+        ascending=[False, False, False],
+        na_position='last',
+    )
     display_breakouts = display_breakouts.set_index('Date')
     return display_breakouts
 
@@ -303,17 +330,24 @@ def get_sector_options(raw_breakouts, metadata):
 ######################
 
 empty_breakouts = pd.DataFrame(
-    columns=['Signal', 'ticker', 'Current Date', 'Current Close', '%change_zscore', 'volume_zscore', 'volume_average', 'Volume(M)', 'SMA20', 'SMA50', 'SMA100', 'SMA200']
+    columns=['Signal', 'ticker', 'Current Date', 'Current Close', '%change_zscore', 'volume_zscore', 'volume_average', 'Volume(M)', 'EMA8', 'EMA20', 'EMA50', 'EMA100', 'EMA200', 'BB8_Lower', 'BB8_Upper']
 ).rename_axis('Date')
 raw_breakouts_by_signal = st.session_state.get('raw_breakouts_by_signal', {})
 legacy_raw_breakouts = st.session_state.get('raw_breakouts', empty_breakouts)
 if any(
-    not cached_breakouts.empty and 'Current Date' not in cached_breakouts.columns
+    not cached_breakouts.empty and (
+        'Current Date' not in cached_breakouts.columns or 'EMA200' not in cached_breakouts.columns
+    )
     for cached_breakouts in raw_breakouts_by_signal.values()
 ):
     raw_breakouts_by_signal = {}
     st.session_state.raw_breakouts_by_signal = raw_breakouts_by_signal
-if not legacy_raw_breakouts.empty and 'Current Date' in legacy_raw_breakouts.columns and 'Breakouts' not in raw_breakouts_by_signal:
+if (
+    not legacy_raw_breakouts.empty
+    and 'Current Date' in legacy_raw_breakouts.columns
+    and 'EMA200' in legacy_raw_breakouts.columns
+    and 'Breakouts' not in raw_breakouts_by_signal
+):
     raw_breakouts_by_signal['Breakouts'] = legacy_raw_breakouts
 metadata = download_metadata()
 st.session_state.metadata = metadata
@@ -327,8 +361,8 @@ with st.sidebar:
     screen_direction = st.radio('Signal', ['Breakouts', 'Breakdowns'], horizontal=True)
     raw_breakouts = raw_breakouts_by_signal.get(screen_direction, empty_breakouts)
     threshold = st.number_input('Z-Score (default=2)', value=2.0)
-    lookback = st.number_input('Lookback days (default=10)', value=10, min_value=0, max_value=120)
-    volavg = st.number_input('Volume Average', value=5.0)
+    lookback = st.number_input('Lookback days (default=20)', value=20, min_value=0, max_value=120)
+    volavg = st.number_input('Volume Average (default=1)', value=1.0)
 
     data = st.session_state.get('data', pd.DataFrame())
     if data.empty:
@@ -357,14 +391,6 @@ with st.sidebar:
 
     breakouts = prepare_breakouts_for_display(raw_breakouts, metadata, volavg, sector_filter)
     chart_tickers = breakouts.ticker.unique().tolist() if not breakouts.empty else []
-    if chart_tickers:
-        total_pages = max(1, (len(chart_tickers) + charts_per_page - 1) // charts_per_page)
-        chart_page = st.number_input('Chart page', value=1, min_value=1, max_value=total_pages)
-        start_idx = (chart_page - 1) * charts_per_page
-        end_idx = start_idx + charts_per_page
-        visible_tickers = chart_tickers[start_idx:end_idx]
-    else:
-        visible_tickers = []
 
     st.markdown(screen_direction)
     if breakouts.empty:
@@ -377,6 +403,21 @@ with st.sidebar:
 
 
 ##### Plotting charts #####
+
+if chart_tickers:
+    total_pages = max(1, (len(chart_tickers) + charts_per_page - 1) // charts_per_page)
+    stored_page = int(st.session_state.get('chart_page', 1))
+    chart_page = min(max(stored_page, 1), total_pages)
+    st.session_state.chart_page = chart_page
+    start_idx = (chart_page - 1) * charts_per_page
+    end_idx = start_idx + charts_per_page
+    visible_tickers = chart_tickers[start_idx:end_idx]
+else:
+    total_pages = 1
+    chart_page = 1
+    visible_tickers = []
+    start_idx = 0
+    end_idx = 0
 
 if visible_tickers:
     st.caption(f'Showing charts {start_idx + 1}-{min(end_idx, len(chart_tickers))} of {len(chart_tickers)}')
@@ -391,4 +432,15 @@ for i, ticker in enumerate(visible_tickers):
             st.markdown(f'{ticker} - [[Finviz]](https://finviz.com/quote.ashx?t={ticker}&p=d) [[Profitviz]](https://profitviz.com/{ticker})')
 
 if chart_tickers:
-    st.code(','.join(chart_tickers), language='text')
+    ticker_readout_col, page_selector_col = st.columns([5, 1], vertical_alignment='bottom')
+    with ticker_readout_col:
+        st.code(','.join(chart_tickers), language='text')
+    with page_selector_col:
+        st.number_input(
+            'Chart page',
+            min_value=1,
+            max_value=total_pages,
+            value=chart_page,
+            key='chart_page',
+        )
+
