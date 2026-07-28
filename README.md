@@ -15,9 +15,11 @@ streamlit run home.py
 
 The home page is a simple entry point for the app. Use the sidebar to navigate to the available trading tools.
 
-### Options GEX Heatmap
+### Options Greek Exposure Heatmap
 
-Downloads option chain data with `yfinance`, estimates Black-Scholes gamma exposure, and visualizes GEX across listed strikes and expirations. The page includes controls for expirations, color scaling, and GEX metric selection.
+Downloads option chain data with `yfinance` and estimates Black-Scholes gamma, Vanna, and Charm exposures across listed strikes and expirations. The sidebar metric selector switches both the heatmap and the total-by-strike chart between Net GEX, Net Vanna Exposure, and Net Charm Exposure. Computed CSV downloads include all three metrics, while the heatmap CSV contains the currently selected metric.
+
+Net GEX is expressed as approximate dollar gamma for a 1% underlying move, Vanna exposure as delta-equivalent shares for a one-percentage-point volatility increase, and Charm exposure as delta-equivalent shares gained or lost per calendar day. These are open-interest-based estimates using a call-positive/put-negative positioning convention, not observed dealer positions.
 
 ### RSI Trend Screener
 

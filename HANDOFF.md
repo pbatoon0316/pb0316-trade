@@ -52,7 +52,7 @@ Decision point:
 
 ### `pages/gex_heatmap.py`
 
-Purpose: options chain analysis tool for examining general options positioning over time.
+Purpose: options chain analysis tool for examining estimated Gamma, Vanna, and Charm positioning across strikes and expirations.
 
 Primary workflow:
 
@@ -60,23 +60,30 @@ Primary workflow:
 2. App downloads the spot price and available option expirations from `yfinance`.
 3. App loads the nearest expiries by default.
 4. User can select and load additional expiries.
-5. App computes approximate Black-Scholes gamma and gamma exposure.
-6. App displays a Plotly heatmap by strike and expiry, plus a side chart of total net GEX by strike.
-7. User can download raw options data, computed GEX, and the heatmap matrix as CSV.
+5. App computes approximate Black-Scholes Gamma, Vanna, and calendar-time Charm exposures together.
+6. User selects Net GEX, Net Vanna Exposure, or Net Charm Exposure from the sidebar metric menu.
+7. App displays the selected metric in a Plotly heatmap by strike and expiry, plus a total-by-strike side chart.
+8. User can download raw options data, a computed dataset containing all three Greeks, and the currently displayed heatmap matrix as CSV.
 
 Important implementation details:
 
 - Uses `st.cache_data` for `yfinance` calls.
-- Uses `st.session_state` to store the active ticker, spot price, expiries, raw option chain data, computed GEX, and heatmap matrix.
+- Uses `st.session_state` to store the active ticker, spot price, expiries, raw option chain data, computed Greek exposures in `greeks_df`, and the selected heatmap matrix.
 - Uses `SR3=F` from `yfinance` as a rough short-rate proxy. If unavailable, falls back to a 5% risk-free rate.
-- Calculates gamma from Black-Scholes using `impliedVolatility`, then estimates dollar gamma exposure per 1% move.
+- Calculates Gamma, Vanna, and Charm from Black-Scholes using `impliedVolatility`. The model currently has no dividend-yield input, effectively using `q = 0`.
+- Net GEX is approximate dollar gamma for a 1% underlying move.
+- Net Vanna Exposure is the estimated change in delta-equivalent shares for a one-percentage-point increase in volatility.
+- Net Charm Exposure is the estimated change in delta-equivalent shares as one calendar day passes. Its sign indicates delta gained or lost; Charm is not assumed to be uniformly negative.
+- All three net metrics use call exposure minus put exposure, weighted by open interest and a 100-share contract multiplier. This is a positioning convention because open interest does not reveal who owns or sold the contracts; it is not observed dealer positioning.
+- The page states these exposure conventions in an understated code block at the bottom.
+- Changing the metric selector redraws both charts from the already-computed `greeks_df`; it does not require another data download or recomputation.
 - Preserves listed strikes only. Missing heatmap cells mean the strike was not listed for that expiry, not that GEX is zero.
 
 Decision points:
 
 - Whether to keep `yfinance` as the data source or swap to a more reliable options data provider.
 - Whether to support persisted snapshots. Today, snapshots live only in session state and downloads.
-- Whether to add expiry-matched rates, dividends, or other model refinements.
+- Whether to add expiry-matched rates, dividend yield, discrete dividends, or other model refinements. Adding dividends changes call-versus-put Charm behavior and requires revisiting the formulas and documentation.
 - Whether to rename or reconcile user-facing references to "heapmap" versus the actual file name `gex_heatmap.py`.
 
 ### `pages/rsi_screener.py`
@@ -220,7 +227,7 @@ Use these when handing the repo to another LLM or programmer:
 - "Preserve `home.py` as a lightweight wall. Do not import heavy page modules from it."
 - "If changing weekly screener logic, check both `rsi_screener.py` and `ttm_screener.py` because they duplicate structure."
 - "If changing data loading, be mindful of Streamlit cache decorators and `st.session_state` keys."
-- "If changing GEX calculations, document the model assumption in the UI or README."
+- "If changing Greek exposure calculations, preserve or explicitly revise the units and call-positive/put-negative positioning convention in the UI and documentation."
 
 ## Manual QA Checklist
 
@@ -234,6 +241,9 @@ Check:
 
 - Home page loads quickly and does not download market data.
 - Sidebar shows all three tools.
-- GEX Heatmap can load a liquid ticker such as `SPY`, load expiries, recompute, render charts, and download CSVs.
+- Greek Exposure Heatmap can load a liquid ticker such as `SPY`, load expiries, and recompute successfully.
+- Net GEX, Net Vanna Exposure, and Net Charm Exposure each update both charts without another download or recomputation.
+- The computed CSV contains all three exposure metrics, and the heatmap CSV matches the selected metric.
+- The exposure-convention note appears at the bottom of the page.
 - RSI Screener loads weekly results, price filters work, sector filter works, mobile toggle works, and charts render or fall back to links.
 - TTM Screener loads weekly results, price filters work, sector filter works, mobile toggle works, and charts render or fall back to links.
