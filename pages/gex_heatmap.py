@@ -8,13 +8,13 @@ import streamlit as st
 import yfinance as yf
 
 
-st.set_page_config(page_title="Options GEX Heatmap", layout="wide")
+st.set_page_config(page_title="Options Greek Exposure Heatmap", layout="wide")
 
 
 METRIC_COLUMNS = {
     "Net GEX": "net_gex",
-    "Call GEX": "call_gex",
-    "Put GEX": "put_gex",
+    "Net Vanna Exposure": "net_vanna_exposure",
+    "Net Charm Exposure": "net_charm_exposure",
 }
 
 
@@ -30,6 +30,7 @@ def reset_data_state():
         "loaded_expiries",
         "raw_options_df",
         "gex_df",
+        "greeks_df",
         "heatmap_df",
         "snapshot_time",
     ]
@@ -194,21 +195,33 @@ def calculate_dte(expiry):
     return (expiry_date - date.today()).days
 
 
-def calculate_black_scholes_gamma(S, K, T, sigma, r):
+def calculate_black_scholes_second_order_greeks(S, K, T, sigma, r):
     if pd.isna(S) or pd.isna(K) or pd.isna(T) or pd.isna(sigma) or pd.isna(r):
-        return np.nan
+        return np.nan, np.nan, np.nan
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return np.nan
+        return np.nan, np.nan, np.nan
     if sigma > 5:
-        return np.nan
+        return np.nan, np.nan, np.nan
 
-    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
     normal_pdf = math.exp(-0.5 * d1**2) / math.sqrt(2 * math.pi)
-    gamma = normal_pdf / (S * sigma * math.sqrt(T))
-    return gamma
+    gamma = normal_pdf / (S * sigma * sqrt_T)
+
+    # Vanna is the change in delta per 1.00 change in volatility. Exposure below
+    # scales it to a one-percentage-point (0.01) volatility move.
+    vanna = -normal_pdf * d2 / sigma
+
+    # Calendar-time charm: d(delta)/d(calendar time) = -d(delta)/d(T).
+    # With no dividend-yield input, call and put charm have the same value.
+    charm = -normal_pdf * (2 * r * T - d2 * sigma * sqrt_T) / (
+        2 * T * sigma * sqrt_T
+    )
+    return gamma, vanna, charm
 
 
-def compute_gex(raw_options_df, spot, risk_free_rate):
+def compute_greek_exposures(raw_options_df, spot, risk_free_rate):
     if raw_options_df.empty:
         return pd.DataFrame()
 
@@ -234,25 +247,29 @@ def compute_gex(raw_options_df, spot, risk_free_rate):
     df["dte"] = df["expiry"].apply(calculate_dte)
     df["T"] = df["dte"].apply(lambda dte: max(dte, 1) / 365.0)
 
-    df["gamma"] = df.apply(
-        lambda row: calculate_black_scholes_gamma(
-            spot,
-            row["strike"],
-            row["T"],
-            row["impliedVolatility"],
-            risk_free_rate,
+    greek_values = df.apply(
+        lambda row: calculate_black_scholes_second_order_greeks(
+            spot, row["strike"], row["T"], row["impliedVolatility"], risk_free_rate
         ),
         axis=1,
+        result_type="expand",
     )
+    greek_values.columns = ["gamma", "vanna", "charm"]
+    df[["gamma", "vanna", "charm"]] = greek_values
 
-    df["call_gamma_value"] = np.where(df["option_type"] == "call", df["gamma"], np.nan)
-    df["put_gamma_value"] = np.where(df["option_type"] == "put", df["gamma"], np.nan)
+    for greek in ["gamma", "vanna", "charm"]:
+        df[f"call_{greek}_value"] = np.where(
+            df["option_type"] == "call", df[greek], np.nan
+        )
+        df[f"put_{greek}_value"] = np.where(
+            df["option_type"] == "put", df[greek], np.nan
+        )
     df["call_oi_value"] = np.where(df["option_type"] == "call", df["openInterest"], 0)
     df["put_oi_value"] = np.where(df["option_type"] == "put", df["openInterest"], 0)
     df["call_volume_value"] = np.where(df["option_type"] == "call", df["volume"], 0)
     df["put_volume_value"] = np.where(df["option_type"] == "put", df["volume"], 0)
 
-    def sum_gamma(values):
+    def sum_greek(values):
         valid_values = values.dropna()
         if valid_values.empty:
             return np.nan
@@ -261,8 +278,12 @@ def compute_gex(raw_options_df, spot, risk_free_rate):
     grouped = (
         df.groupby(["ticker", "expiry", "dte", "strike"], dropna=False)
         .agg(
-            call_gamma=("call_gamma_value", sum_gamma),
-            put_gamma=("put_gamma_value", sum_gamma),
+            call_gamma=("call_gamma_value", sum_greek),
+            put_gamma=("put_gamma_value", sum_greek),
+            call_vanna=("call_vanna_value", sum_greek),
+            put_vanna=("put_vanna_value", sum_greek),
+            call_charm=("call_charm_value", sum_greek),
+            put_charm=("put_charm_value", sum_greek),
             call_oi=("call_oi_value", "sum"),
             put_oi=("put_oi_value", "sum"),
             call_volume=("call_volume_value", "sum"),
@@ -271,30 +292,73 @@ def compute_gex(raw_options_df, spot, risk_free_rate):
         .reset_index()
     )
 
-    grouped["call_gamma"] = np.where(grouped["call_oi"] == 0, 0, grouped["call_gamma"])
-    grouped["put_gamma"] = np.where(grouped["put_oi"] == 0, 0, grouped["put_gamma"])
+    for greek in ["gamma", "vanna", "charm"]:
+        grouped[f"call_{greek}"] = np.where(
+            grouped["call_oi"] == 0, 0, grouped[f"call_{greek}"]
+        )
+        grouped[f"put_{greek}"] = np.where(
+            grouped["put_oi"] == 0, 0, grouped[f"put_{greek}"]
+        )
 
     # Gamma exposure is approximate dollar gamma per 1% move in the underlying.
     gex_multiplier = 100 * spot**2 * 0.01
     grouped["call_gex"] = grouped["call_gamma"] * grouped["call_oi"] * gex_multiplier
     grouped["put_gex"] = -1 * grouped["put_gamma"] * grouped["put_oi"] * gex_multiplier
     grouped["net_gex"] = grouped["call_gex"] + grouped["put_gex"]
+
+    contract_multiplier = 100
+    one_volatility_point = 0.01
+    one_calendar_day = 1 / 365.0
+    grouped["call_vanna_exposure"] = (
+        grouped["call_vanna"]
+        * grouped["call_oi"]
+        * contract_multiplier
+        * one_volatility_point
+    )
+    grouped["put_vanna_exposure"] = (
+        -1
+        * grouped["put_vanna"]
+        * grouped["put_oi"]
+        * contract_multiplier
+        * one_volatility_point
+    )
+    grouped["net_vanna_exposure"] = (
+        grouped["call_vanna_exposure"] + grouped["put_vanna_exposure"]
+    )
+    grouped["call_charm_exposure"] = (
+        grouped["call_charm"]
+        * grouped["call_oi"]
+        * contract_multiplier
+        * one_calendar_day
+    )
+    grouped["put_charm_exposure"] = (
+        -1
+        * grouped["put_charm"]
+        * grouped["put_oi"]
+        * contract_multiplier
+        * one_calendar_day
+    )
+    grouped["net_charm_exposure"] = (
+        grouped["call_charm_exposure"] + grouped["put_charm_exposure"]
+    )
     grouped["total_oi"] = grouped["call_oi"] + grouped["put_oi"]
     grouped["total_volume"] = grouped["call_volume"] + grouped["put_volume"]
 
     return grouped.sort_values(["expiry", "strike"]).reset_index(drop=True)
 
 
-def build_listed_strikes_heatmap_matrix(gex_df, selected_expiries, metric, lower_strike, upper_strike):
-    if gex_df.empty:
+def build_listed_strikes_heatmap_matrix(
+    greeks_df, selected_expiries, metric, lower_strike, upper_strike
+):
+    if greeks_df.empty:
         return pd.DataFrame()
 
     metric_column = METRIC_COLUMNS[metric]
 
-    filtered_df = gex_df[
-        (gex_df["expiry"].isin(selected_expiries))
-        & (gex_df["strike"] >= lower_strike)
-        & (gex_df["strike"] <= upper_strike)
+    filtered_df = greeks_df[
+        (greeks_df["expiry"].isin(selected_expiries))
+        & (greeks_df["strike"] >= lower_strike)
+        & (greeks_df["strike"] <= upper_strike)
     ].copy()
 
     if filtered_df.empty:
@@ -316,7 +380,7 @@ def build_listed_strikes_heatmap_matrix(gex_df, selected_expiries, metric, lower
     return heatmap_df
 
 
-def format_gex_value(value):
+def format_exposure_value(value):
     if pd.isna(value):
         return ""
 
@@ -370,7 +434,7 @@ def make_heatmap_fig(heatmap_df, metric, color_scale_mode, spot, ticker, snapsho
             row_text.append(
                 f"Expiry: {expiry}"
                 f"<br>Strike: {strike:g}"
-                f"<br>{metric}: {format_gex_value(value)}"
+                f"<br>{metric}: {format_exposure_value(value)}"
                 f"<br>Volume: {format_count_value(volume)}"
                 f"<br>Open Interest: {format_count_value(open_interest)}"
             )
@@ -423,33 +487,36 @@ def make_heatmap_fig(heatmap_df, metric, color_scale_mode, spot, ticker, snapsho
     return fig, None
 
 
-def make_total_gex_by_strike_fig(gex_df, selected_expiries, lower_strike, upper_strike, spot):
-    filtered_df = gex_df[
-        (gex_df["expiry"].isin(selected_expiries))
-        & (gex_df["strike"] >= lower_strike)
-        & (gex_df["strike"] <= upper_strike)
+def make_total_exposure_by_strike_fig(
+    greeks_df, selected_expiries, metric, lower_strike, upper_strike, spot
+):
+    filtered_df = greeks_df[
+        (greeks_df["expiry"].isin(selected_expiries))
+        & (greeks_df["strike"] >= lower_strike)
+        & (greeks_df["strike"] <= upper_strike)
     ].copy()
 
     if filtered_df.empty:
         return None
 
-    total_gex_by_strike = filtered_df.groupby("strike")["net_gex"].sum(min_count=1)
-    total_gex_by_strike = total_gex_by_strike.dropna()
+    metric_column = METRIC_COLUMNS[metric]
+    total_exposure_by_strike = filtered_df.groupby("strike")[metric_column].sum(min_count=1)
+    total_exposure_by_strike = total_exposure_by_strike.dropna()
 
-    if total_gex_by_strike.empty:
+    if total_exposure_by_strike.empty:
         return None
 
-    colors = np.where(total_gex_by_strike >= 0, "#276419", "#8e0152")
+    colors = np.where(total_exposure_by_strike >= 0, "#276419", "#8e0152")
 
     fig = go.Figure(
         data=go.Bar(
-            x=total_gex_by_strike.values,
-            y=total_gex_by_strike.index,
+            x=total_exposure_by_strike.values,
+            y=total_exposure_by_strike.index,
             orientation="h",
             marker_color=colors,
             hovertemplate=(
                 "Strike: %{y:g}<br>"
-                "Total GEX: %{x:,.0f}"
+                f"Total {metric}: %{{x:,.2f}}"
                 "<extra></extra>"
             ),
         )
@@ -464,8 +531,8 @@ def make_total_gex_by_strike_fig(gex_df, selected_expiries, lower_strike, upper_
     )
 
     fig.update_layout(
-        title="Total GEX by Strike",
-        xaxis_title="GEX",
+        title=f"Total {metric} by Strike",
+        xaxis_title=metric,
         yaxis_title="",
         height=720,
         margin=dict(l=20, r=20, t=70, b=40),
@@ -496,7 +563,7 @@ def show_snapshot_metrics():
 
 def render_data_download_buttons():
     raw_options_df = st.session_state.get("raw_options_df")
-    gex_df = st.session_state.get("gex_df")
+    greeks_df = st.session_state.get("greeks_df")
     heatmap_df = st.session_state.get("heatmap_df")
 
     cols = st.columns(3)
@@ -508,11 +575,11 @@ def render_data_download_buttons():
             mime="text/csv",
         )
 
-    if gex_df is not None and not gex_df.empty:
+    if greeks_df is not None and not greeks_df.empty:
         cols[1].download_button(
-            "Download GEX CSV",
-            dataframe_to_csv(gex_df),
-            file_name="computed_gex.csv",
+            "Download computed Greeks CSV",
+            dataframe_to_csv(greeks_df),
+            file_name="computed_greek_exposures.csv",
             mime="text/csv",
         )
 
@@ -527,16 +594,16 @@ def render_data_download_buttons():
 
 def render_data_tables():
     raw_options_df = st.session_state.get("raw_options_df")
-    gex_df = st.session_state.get("gex_df")
+    greeks_df = st.session_state.get("greeks_df")
     heatmap_df = st.session_state.get("heatmap_df")
 
     if raw_options_df is not None and not raw_options_df.empty:
         with st.expander("Show raw options data"):
             st.dataframe(raw_options_df, use_container_width=True)
 
-    if gex_df is not None and not gex_df.empty:
-        with st.expander("Show computed GEX data"):
-            st.dataframe(gex_df, use_container_width=True)
+    if greeks_df is not None and not greeks_df.empty:
+        with st.expander("Show computed Greek exposure data"):
+            st.dataframe(greeks_df, use_container_width=True)
 
     if heatmap_df is not None and not heatmap_df.empty:
         with st.expander("Show heatmap matrix"):
@@ -660,16 +727,16 @@ def main():
         elif not st.session_state.get("selected_expiries"):
             st.warning("Select at least one expiration date.")
         else:
-            with st.spinner("Computing GEX and drawing heatmap..."):
+            with st.spinner("Computing Greek exposures and drawing heatmap..."):
                 selected_expiries = st.session_state["selected_expiries"]
                 working_raw_df = raw_options_df[raw_options_df["expiry"].isin(selected_expiries)].copy()
 
-                gex_df = compute_gex(
+                greeks_df = compute_greek_exposures(
                     working_raw_df,
                     st.session_state["spot"],
                     st.session_state["risk_free_rate"],
                 )
-                st.session_state["gex_df"] = gex_df
+                st.session_state["greeks_df"] = greeks_df
 
     if "raw_options_df" not in st.session_state:
         st.info("Enter a ticker to begin.")
@@ -677,15 +744,15 @@ def main():
 
     show_snapshot_metrics()
 
-    gex_df = st.session_state.get("gex_df")
+    greeks_df = st.session_state.get("greeks_df")
     if (
-        gex_df is not None
-        and not gex_df.empty
+        greeks_df is not None
+        and not greeks_df.empty
         and lower_strike is not None
         and upper_strike is not None
     ):
         heatmap_df = build_listed_strikes_heatmap_matrix(
-            gex_df,
+            greeks_df,
             st.session_state["selected_expiries"],
             metric,
             lower_strike,
@@ -705,24 +772,35 @@ def main():
         if warning_message:
             st.warning(warning_message)
         else:
-            total_gex_fig = make_total_gex_by_strike_fig(
-                gex_df,
+            total_exposure_fig = make_total_exposure_by_strike_fig(
+                greeks_df,
                 st.session_state["selected_expiries"],
+                metric,
                 lower_strike,
                 upper_strike,
                 st.session_state["spot"],
             )
-            heatmap_col, gex_col = st.columns([3, 2])
+            heatmap_col, exposure_col = st.columns([3, 2])
 
             with heatmap_col:
                 st.plotly_chart(fig, use_container_width=True)
 
-            with gex_col:
-                if total_gex_fig is not None:
-                    st.plotly_chart(total_gex_fig, use_container_width=True)
+            with exposure_col:
+                if total_exposure_fig is not None:
+                    st.plotly_chart(total_exposure_fig, use_container_width=True)
 
     render_data_download_buttons()
     render_data_tables()
+
+    st.code(
+        "Exposure convention\n"
+        "Net GEX: dollar gamma for a 1% underlying move.\n"
+        "Net Vanna Exposure: delta shares for a 1 volatility-point increase.\n"
+        "Net Charm Exposure: delta shares gained (+) or lost (-) per calendar day.\n"
+        "All net values use call exposure minus put exposure based on open interest.\n"
+        "This is a positioning convention, not observed dealer positioning.",
+        language=None,
+    )
 
 
 if __name__ == "__main__":
