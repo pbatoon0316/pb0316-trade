@@ -8,9 +8,6 @@ import streamlit as st
 import yfinance as yf
 
 
-st.set_page_config(page_title="Options Greek Exposure Heatmap", layout="wide")
-
-
 METRIC_COLUMNS = {
     "Net GEX": "net_gex",
     "Net Vanna Exposure": "net_vanna_exposure",
@@ -660,6 +657,8 @@ def download_initial_snapshot(ticker):
 
 
 def main():
+    st.set_page_config(page_title="Options Greek Exposure Heatmap", layout="wide")
+
     with st.sidebar:
         ticker_input = st.text_input("Ticker", value=st.session_state.get("ticker", "SPY"))
         ticker = ticker_input.strip().upper()
