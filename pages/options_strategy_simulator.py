@@ -1846,8 +1846,10 @@ def main() -> None:
     strike_key = "_".join(f"{leg.strike:g}" for leg in selected_legs)
     front_starting_iv = average_starting_iv(selected_legs, front_expiration)
     front_iv_label = (
-        "Front IV adjustment" if is_time_spread else "IV adjustment"
-    ) + f" ({signed_iv(front_starting_iv)} start)"
+        "Front Implied Volatility (IV)"
+        if is_time_spread
+        else "Implied Volatility (IV)"
+    )
 
     with main_view:
         st.divider()
@@ -1867,28 +1869,33 @@ def main() -> None:
             help="Defaults to about 3% beyond the outer expiration breakevens.",
         )
     with control_mid:
-        front_iv_points = st.slider(
+        front_iv_percent = st.number_input(
             front_iv_label,
-            min_value=-30.0,
-            max_value=30.0,
-            value=0.0,
-            step=0.5,
-            help="A +5 point adjustment changes 20% IV to 25% IV.",
-            key=f"front_iv_adjustment_{context_key}",
+            min_value=0.1,
+            max_value=500.0,
+            value=max(float(front_starting_iv * 100.0), 0.1),
+            step=0.1,
+            format="%.1f",
+            help="Enter IV as a percentage, such as 14.6 for 14.6%.",
+            key=f"front_iv_value_{context_key}_{strike_key}",
         )
+        front_iv_points = front_iv_percent - front_starting_iv * 100.0
     if control_right is not None:
         with control_right:
             back_starting_iv = average_starting_iv(
                 selected_legs, back_expiration
             )
-            back_iv_points = st.slider(
-                f"Back IV adjustment ({signed_iv(back_starting_iv)} start)",
-                min_value=-30.0,
-                max_value=30.0,
-                value=0.0,
-                step=0.5,
-                key=f"back_iv_adjustment_{context_key}",
+            back_iv_percent = st.number_input(
+                "Back Implied Volatility (IV)",
+                min_value=0.1,
+                max_value=500.0,
+                value=max(float(back_starting_iv * 100.0), 0.1),
+                step=0.1,
+                format="%.1f",
+                help="Enter IV as a percentage, such as 14.6 for 14.6%.",
+                key=f"back_iv_value_{context_key}_{strike_key}",
             )
+            back_iv_points = back_iv_percent - back_starting_iv * 100.0
     else:
         back_iv_points = front_iv_points
 
