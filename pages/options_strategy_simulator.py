@@ -1230,6 +1230,7 @@ def build_pnl_figure(
     curve_expiration: date,
     break_even_points: Sequence[float],
     is_time_spread: bool,
+    legs: Sequence[OptionLeg] = (),
     pnl_percentage_basis: float | None = None,
 ) -> go.Figure:
     figure = go.Figure()
@@ -1329,6 +1330,39 @@ def build_pnl_figure(
         y_span = max(abs(y_min), 1.0)
     y_padding = y_span * 0.08
     y_range = [y_min - y_padding, y_max + y_padding]
+
+    # Directional triangles point toward the zero line: short legs sit just
+    # above it and long legs just below it. One trace per side keeps the legend
+    # compact even for four-leg structures.
+    marker_offset = y_span * 0.025
+    for side, name, y_value, symbol, color in (
+        (-1, "Short strikes", marker_offset, "triangle-down", "#dc2626"),
+        (1, "Long strikes", -marker_offset, "triangle-up", "#16a34a"),
+    ):
+        side_legs = [leg for leg in legs if leg.side == side]
+        if not side_legs:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=[leg.strike for leg in side_legs],
+                y=[y_value] * len(side_legs),
+                mode="markers",
+                name=name,
+                marker={
+                    "symbol": symbol,
+                    "size": 18,
+                    "color": color,
+                    "line": {"color": "#ffffff", "width": 1},
+                },
+                customdata=[
+                    f"{leg.label} · {leg.expiration:%b %d, %Y}"
+                    for leg in side_legs
+                ],
+                hovertemplate=(
+                    "%{customdata}<br>Strike $%{x:,.2f}<extra></extra>"
+                ),
+            )
+        )
 
     percentage_axis: dict[str, object] = {"visible": False}
     if pnl_percentage_basis is not None and abs(pnl_percentage_basis) > 1e-9:
@@ -1529,7 +1563,7 @@ def advanced_metric_groups(
         ("Front − back IV", optional_metric(advanced.raw_iv_gap_points, "{:+.1f} pt")),
     ]
     return [
-        ("SECONDARY ENTRY GREEKS", secondary_greeks),
+        ("", secondary_greeks),
         ("EFFICIENCY & VEGA RATIOS", ratios),
         ("SCENARIOS", scenarios),
     ]
@@ -1537,8 +1571,12 @@ def advanced_metric_groups(
 
 def render_advanced_metric_sections(advanced: AdvancedMetrics) -> None:
     sections = "".join(
-        f'<div class="metric-readout-heading metric-readout-greeks">{heading}</div>'
-        f"{metric_rows_html(rows)}"
+        (
+            f'<div class="metric-readout-heading metric-readout-greeks">{heading}</div>'
+            if heading
+            else ""
+        )
+        + metric_rows_html(rows)
         for heading, rows in advanced_metric_groups(advanced)
     )
     st.markdown(
@@ -1899,6 +1937,7 @@ def main() -> None:
         front_expiration,
         break_even_points,
         is_time_spread,
+        legs=selected_legs,
         pnl_percentage_basis=abs(entry_dollars),
     )
     with main_view:
