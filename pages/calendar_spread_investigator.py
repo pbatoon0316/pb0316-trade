@@ -1,31 +1,715 @@
 from __future__ import annotations
 
-import pandas as pd
-import streamlit as st
+from dataclasses import dataclass
+from datetime import datetime
+import math
+from pathlib import Path
+import re
+import tempfile
+from zoneinfo import ZoneInfo
 
-from calendar_spread.analytics import (
-    METRICS,
-    add_pair_deltas,
-    available_strikes,
-    build_pair_metrics,
-    compute_historical_volatility,
-    directional_atm_strike,
-    interpolated_atm_iv,
-    optionstrat_calendar_url,
-    rank_pairs,
-    strike_term_structure,
-    term_structure_strikes,
-)
-from calendar_spread.charts import (
-    historical_volatility_figure,
-    pair_heatmap_figure,
-    term_structure_figure,
-)
-from calendar_spread.data import (
-    load_calendar_snapshot,
-    load_next_earnings,
-    load_price_history,
-)
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+
+# Analytics
+
+
+@dataclass(frozen=True)
+class MetricDefinition:
+    label: str
+    column: str
+    decimals: int
+    diverging: bool
+
+
+METRICS = {
+    "signed_iv_gap": MetricDefinition(
+        "Front IV − Back IV (vol pts)", "signed_iv_gap", 2, True
+    ),
+    "iv_gap_per_day": MetricDefinition(
+        "Front IV − Back IV per day", "iv_gap_per_day", 3, True
+    ),
+    "forward_iv": MetricDefinition("Implied forward IV (%)", "forward_iv", 2, False),
+}
+
+
+def available_strikes(options: pd.DataFrame, option_type: str) -> list[float]:
+    values = options.loc[options["option_type"] == option_type, "strike"].dropna().unique()
+    return sorted(float(value) for value in values)
+
+
+def directional_atm_strike(
+    strikes: list[float], spot: float, option_type: str
+) -> float:
+    if not strikes:
+        raise ValueError("No strikes are available for this option type.")
+    ordered = sorted(float(strike) for strike in strikes)
+    if option_type == "call":
+        call_target = float(math.ceil(spot))
+        at_or_above = [strike for strike in ordered if strike >= call_target]
+        return at_or_above[0] if at_or_above else ordered[-1]
+    put_target = float(math.floor(spot))
+    at_or_below = [strike for strike in ordered if strike <= put_target]
+    return at_or_below[-1] if at_or_below else ordered[0]
+
+
+def term_structure_strikes(
+    strikes: list[float],
+    spot: float,
+    selected_strike: float,
+    option_type: str,
+    pct_band: float = 0.01,
+    maximum_lines: int = 5,
+) -> list[float]:
+    """Choose a compact one-sided strike band in the option's OTM direction."""
+    ordered = sorted(float(strike) for strike in strikes)
+    if not ordered:
+        return []
+
+    selected_index = min(
+        range(len(ordered)), key=lambda index: abs(ordered[index] - selected_strike)
+    )
+    selected = ordered[selected_index]
+    if option_type == "call":
+        directional = ordered[selected_index:]
+        in_band = [strike for strike in directional if strike <= spot * (1 + pct_band)]
+    else:
+        directional = list(reversed(ordered[: selected_index + 1]))
+        in_band = [strike for strike in directional if strike >= spot * (1 - pct_band)]
+
+    candidates = list(in_band[:maximum_lines])
+    for strike in directional:
+        if len(candidates) >= maximum_lines:
+            break
+        if strike not in candidates:
+            candidates.append(strike)
+    if selected not in candidates:
+        candidates.insert(0, selected)
+    return sorted(candidates[:maximum_lines])
+
+
+def strike_term_structure(
+    options: pd.DataFrame, option_type: str, strike: float
+) -> pd.DataFrame:
+    matching = options[
+        (options["option_type"] == option_type)
+        & np.isclose(options["strike"].astype(float), float(strike))
+    ].copy()
+    if matching.empty:
+        return pd.DataFrame(columns=["expiry", "dte", "iv"])
+
+    matching["iv"] = matching["impliedVolatility"].astype(float)
+    term = (
+        matching.groupby(["expiry", "dte"], as_index=False)["iv"]
+        .median()
+        .sort_values(["dte", "expiry"])
+    )
+    return term.reset_index(drop=True)
+
+
+def build_pair_metrics(term: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    records = term.sort_values("dte").to_dict("records")
+    for front_index, front in enumerate(records):
+        for back in records[front_index + 1 :]:
+            if int(front["dte"]) >= int(back["dte"]):
+                continue
+
+            front_iv = float(front["iv"])
+            back_iv = float(back["iv"])
+            day_gap = int(back["dte"]) - int(front["dte"])
+            signed_gap = (front_iv - back_iv) * 100.0
+            front_variance = front_iv**2 * float(front["dte"]) / 365.0
+            back_variance = back_iv**2 * float(back["dte"]) / 365.0
+            forward_variance = (back_variance - front_variance) / (day_gap / 365.0)
+
+            rows.append(
+                {
+                    "front_expiry": pd.Timestamp(front["expiry"]),
+                    "back_expiry": pd.Timestamp(back["expiry"]),
+                    "front_dte": int(front["dte"]),
+                    "back_dte": int(back["dte"]),
+                    "front_iv": front_iv * 100.0,
+                    "back_iv": back_iv * 100.0,
+                    "signed_iv_gap": signed_gap,
+                    "iv_gap_per_day": signed_gap / day_gap,
+                    "forward_iv": (
+                        np.sqrt(forward_variance) * 100.0
+                        if forward_variance >= 0
+                        else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def rank_pairs(pairs: pd.DataFrame, metric_key: str, limit: int = 10) -> pd.DataFrame:
+    metric = METRICS[metric_key]
+    if pairs.empty:
+        return pairs.copy()
+    ranked = (
+        pairs[pairs["signed_iv_gap"] > 0]
+        .dropna(subset=[metric.column])
+        .sort_values(metric.column, ascending=False)
+        .head(limit)
+        .copy()
+    )
+    ranked.insert(0, "rank", range(1, len(ranked) + 1))
+    return ranked
+
+
+def black_scholes_delta(
+    spot: float,
+    strike: float,
+    dte: int,
+    iv_percent: float,
+    option_type: str,
+    risk_free_rate: float = 0.0,
+) -> float:
+    """Estimate a contract delta from the option-chain IV already in memory."""
+    time_to_expiry = max(float(dte), 1.0) / 365.0
+    volatility = float(iv_percent) / 100.0
+    if spot <= 0 or strike <= 0 or volatility <= 0:
+        return np.nan
+    d1 = (
+        math.log(float(spot) / float(strike))
+        + (risk_free_rate + 0.5 * volatility**2) * time_to_expiry
+    ) / (volatility * math.sqrt(time_to_expiry))
+    call_delta = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+    return call_delta if option_type == "call" else call_delta - 1.0
+
+
+def add_pair_deltas(
+    ranked: pd.DataFrame,
+    spot: float,
+    strike: float,
+    option_type: str,
+) -> pd.DataFrame:
+    """Add front/back estimated deltas only after the display pairs are ranked."""
+    result = ranked.copy()
+    if result.empty:
+        result["front_delta"] = pd.Series(dtype=float)
+        result["back_delta"] = pd.Series(dtype=float)
+        return result
+    result["front_delta"] = result.apply(
+        lambda row: black_scholes_delta(
+            spot, strike, row["front_dte"], row["front_iv"], option_type
+        ),
+        axis=1,
+    )
+    result["back_delta"] = result.apply(
+        lambda row: black_scholes_delta(
+            spot, strike, row["back_dte"], row["back_iv"], option_type
+        ),
+        axis=1,
+    )
+    return result
+
+
+def optionstrat_calendar_url(
+    ticker: str,
+    option_type: str,
+    strike: float,
+    front_expiry,
+    back_expiry,
+    options: pd.DataFrame | None = None,
+) -> str:
+    """Build an OptionStrat long-calendar URL for a ranked expiration pair."""
+
+    def leg_symbol(expiry) -> str:
+        expiry = pd.Timestamp(expiry)
+        if options is not None and "contractSymbol" in options.columns:
+            matches = options[
+                (options["option_type"] == option_type)
+                & (options["expiry"] == expiry)
+                & np.isclose(options["strike"].astype(float), float(strike))
+            ]
+            if not matches.empty:
+                contract_symbol = str(matches.iloc[0]["contractSymbol"])
+                occ_match = re.fullmatch(r"(.+?)(\d{6})([CP])(\d{8})", contract_symbol)
+                if occ_match:
+                    root, expiry_code, call_put, strike_code = occ_match.groups()
+                    contract_strike = int(strike_code) / 1000.0
+                    return f".{root}{expiry_code}{call_put}{contract_strike:g}"
+
+        root = ticker.upper().lstrip("^").replace("-", "")
+        call_put = "C" if option_type == "call" else "P"
+        return f".{root}{expiry:%y%m%d}{call_put}{float(strike):g}"
+
+    underlying = ticker.upper().lstrip("^")
+    strategy = "calendar-call-spread" if option_type == "call" else "calendar-put-spread"
+    front_leg = leg_symbol(front_expiry)
+    back_leg = leg_symbol(back_expiry)
+    return (
+        f"https://optionstrat.com/build/{strategy}/{underlying}/"
+        f"-{front_leg},{back_leg}"
+    )
+
+
+def compute_historical_volatility(price_history: pd.DataFrame) -> pd.DataFrame:
+    close = pd.to_numeric(price_history["Close"], errors="coerce").dropna()
+    log_returns = np.log(close / close.shift(1))
+    result = pd.DataFrame(index=close.index)
+    for window in (5, 10, 20, 30, 50, 100):
+        result[f"HV{window}"] = (
+            log_returns.rolling(window).std(ddof=1) * np.sqrt(252.0) * 100.0
+        )
+    return result.dropna(how="all")
+
+
+def interpolated_atm_iv(
+    options: pd.DataFrame, spot: float, target_dte: int = 30
+) -> dict | None:
+    """Estimate constant-maturity ATM IV by interpolating total variance."""
+    rows = []
+    for (expiry, dte), expiry_frame in options.groupby(["expiry", "dte"]):
+        if int(dte) <= 0:
+            continue
+        type_ivs = []
+        for option_type in ("call", "put"):
+            candidates = expiry_frame[expiry_frame["option_type"] == option_type].copy()
+            candidates = candidates[candidates["impliedVolatility"].notna()]
+            if candidates.empty:
+                continue
+            nearest_index = (candidates["strike"].astype(float) - spot).abs().idxmin()
+            type_ivs.append(float(candidates.loc[nearest_index, "impliedVolatility"]))
+        if type_ivs:
+            rows.append(
+                {
+                    "expiry": pd.Timestamp(expiry),
+                    "dte": int(dte),
+                    "iv": float(np.mean(type_ivs)),
+                }
+            )
+
+    term = pd.DataFrame(rows).sort_values("dte") if rows else pd.DataFrame()
+    if term.empty:
+        return None
+
+    exact = term[term["dte"] == target_dte]
+    if not exact.empty:
+        row = exact.iloc[0]
+        return {
+            "iv": float(row["iv"]),
+            "lower_dte": target_dte,
+            "upper_dte": target_dte,
+        }
+
+    lower = term[term["dte"] < target_dte]
+    upper = term[term["dte"] > target_dte]
+    if lower.empty or upper.empty:
+        return None
+
+    lower_row = lower.iloc[-1]
+    upper_row = upper.iloc[0]
+    lower_time = float(lower_row["dte"]) / 365.0
+    upper_time = float(upper_row["dte"]) / 365.0
+    target_time = float(target_dte) / 365.0
+    lower_variance = float(lower_row["iv"]) ** 2 * lower_time
+    upper_variance = float(upper_row["iv"]) ** 2 * upper_time
+    weight = (target_time - lower_time) / (upper_time - lower_time)
+    target_variance = lower_variance + weight * (upper_variance - lower_variance)
+    if target_variance < 0:
+        return None
+
+    return {
+        "iv": float(np.sqrt(target_variance / target_time)),
+        "lower_dte": int(lower_row["dte"]),
+        "upper_dte": int(upper_row["dte"]),
+    }
+
+
+# Market data
+
+
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+YFINANCE_CACHE = Path(tempfile.gettempdir()) / "pb0316_yfinance_cache"
+YFINANCE_CACHE.mkdir(parents=True, exist_ok=True)
+yf.set_tz_cache_location(str(YFINANCE_CACHE))
+
+
+def market_date():
+    return datetime.now(MARKET_TIMEZONE).date()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _spot_price(ticker: str) -> float:
+    stock = yf.Ticker(ticker)
+    try:
+        last_price = stock.fast_info["last_price"]
+        if pd.notna(last_price) and float(last_price) > 0:
+            return float(last_price)
+    except Exception:
+        pass
+
+    history = stock.history(period="5d", auto_adjust=True)
+    if history.empty or history["Close"].dropna().empty:
+        raise ValueError(f"No current price was returned for {ticker}.")
+    return float(history["Close"].dropna().iloc[-1])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _listed_expiries(ticker: str) -> list[str]:
+    return list(yf.Ticker(ticker).options)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _chain_for_expiry(ticker: str, expiry: str) -> pd.DataFrame:
+    chain = yf.Ticker(ticker).option_chain(expiry)
+    frames = []
+    for option_type, frame in (("call", chain.calls), ("put", chain.puts)):
+        if frame.empty:
+            continue
+        option_frame = frame.copy()
+        option_frame["option_type"] = option_type
+        option_frame["expiry"] = pd.Timestamp(expiry)
+        frames.append(option_frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_calendar_snapshot(ticker: str, max_dte: int = 60):
+    """Load the spot and every listed option chain through max_dte."""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise ValueError("Enter a ticker symbol.")
+
+    as_of = market_date()
+    spot = _spot_price(ticker)
+    listed_expiries = _listed_expiries(ticker)
+    expiries = []
+    for expiry in listed_expiries:
+        expiry_date = pd.Timestamp(expiry).date()
+        dte = (expiry_date - as_of).days
+        if 0 <= dte <= max_dte:
+            expiries.append(expiry)
+
+    if len(expiries) < 2:
+        raise ValueError(
+            f"Fewer than two option expirations were found within {max_dte} DTE."
+        )
+
+    frames: list[pd.DataFrame] = []
+    failures: list[str] = []
+    for expiry in expiries:
+        try:
+            frame = _chain_for_expiry(ticker, expiry)
+            if frame.empty:
+                failures.append(expiry)
+            else:
+                frames.append(frame)
+        except Exception:
+            failures.append(expiry)
+
+    if not frames:
+        raise ValueError("No option-chain data was returned.")
+
+    options = pd.concat(frames, ignore_index=True)
+    options["strike"] = pd.to_numeric(options["strike"], errors="coerce")
+    options["impliedVolatility"] = pd.to_numeric(
+        options["impliedVolatility"], errors="coerce"
+    )
+    options["dte"] = options["expiry"].map(
+        lambda value: (value.date() - as_of).days
+    )
+    options = options[
+        options["strike"].notna()
+        & options["impliedVolatility"].between(0.0001, 10.0)
+    ].copy()
+
+    return spot, options, sorted(failures), datetime.now(MARKET_TIMEZONE)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
+    history = yf.Ticker(ticker.strip().upper()).history(period=period, auto_adjust=True)
+    if history.empty or "Close" not in history:
+        raise ValueError(f"No price history was returned for {ticker}.")
+    return history[["Close"]].dropna().copy()
+
+
+def earnings_session(timestamp: pd.Timestamp) -> str:
+    """Classify Yahoo's earnings timestamp into a market session."""
+    hour = timestamp.hour
+    if hour < 12:
+        return "Before open"
+    if hour >= 16:
+        return "After close"
+    return "Time not provided"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_next_earnings(ticker: str) -> dict | None:
+    """Return the next Yahoo earnings timestamp and its reported market session."""
+    ticker = ticker.strip().upper()
+    now = pd.Timestamp.now(tz=str(MARKET_TIMEZONE))
+    try:
+        earnings = yf.Ticker(ticker).get_earnings_dates(limit=12)
+    except Exception:
+        earnings = None
+
+    if earnings is not None and not earnings.empty:
+        dates = pd.DatetimeIndex(earnings.index)
+        if dates.tz is None:
+            dates = dates.tz_localize(MARKET_TIMEZONE)
+        else:
+            dates = dates.tz_convert(MARKET_TIMEZONE)
+        future_dates = dates[dates >= now]
+        if len(future_dates):
+            timestamp = pd.Timestamp(future_dates.min())
+            return {
+                "timestamp": timestamp,
+                "date": timestamp.date(),
+                "session": earnings_session(timestamp),
+                "has_time": True,
+            }
+
+    try:
+        calendar = yf.Ticker(ticker).calendar or {}
+        calendar_dates = calendar.get("Earnings Date", [])
+        if calendar_dates:
+            next_date = min(
+                pd.Timestamp(value).date()
+                for value in calendar_dates
+                if pd.Timestamp(value).date() >= now.date()
+            )
+            return {
+                "timestamp": None,
+                "date": next_date,
+                "session": "Time not provided",
+                "has_time": False,
+            }
+    except (Exception, ValueError):
+        pass
+    return None
+
+
+# Charts
+
+
+def _expiry_label(expiry, dte: int) -> str:
+    return f"{pd.Timestamp(expiry):%b %d} ({int(dte)}d)"
+
+
+def term_structure_figure(
+    terms_by_strike: dict[float, pd.DataFrame],
+    option_type: str,
+    selected_strike: float,
+    spot: float,
+    earnings_dte: int | None = None,
+    earnings_label: str | None = None,
+    max_dte: int = 60,
+) -> go.Figure:
+    figure = go.Figure()
+    palette = ("#636efa", "#ef553b", "#00cc96", "#ab63fa", "#ffa15a", "#19d3f3")
+    ordered_strikes = sorted(
+        terms_by_strike,
+        key=lambda value: (np.isclose(value, selected_strike), value),
+    )
+    for index, strike in enumerate(ordered_strikes):
+        term = terms_by_strike[strike]
+        is_selected = bool(np.isclose(strike, selected_strike))
+        labels = [_expiry_label(row.expiry, row.dte) for row in term.itertuples()]
+        figure.add_trace(
+            go.Scatter(
+                x=term["dte"],
+                y=term["iv"] * 100.0,
+                mode="lines+markers",
+                name=f"Strike {strike:g}" + (" · selected" if is_selected else ""),
+                opacity=1.0 if is_selected else 0.5,
+                line={
+                    "color": "#2563eb" if is_selected else palette[index % len(palette)],
+                    "width": 3 if is_selected else 1.5,
+                },
+                marker={"size": 8 if is_selected else 5},
+                customdata=np.column_stack(
+                    (
+                        labels,
+                        term["expiry"].dt.strftime("%Y-%m-%d"),
+                        np.full(len(term), strike),
+                    )
+                ),
+                hovertemplate=(
+                    "Strike: %{customdata[2]}<br>%{customdata[0]}"
+                    "<br>Expiry: %{customdata[1]}<br>IV: %{y:.2f}%<extra></extra>"
+                ),
+            )
+        )
+
+    if earnings_dte is not None and 0 <= earnings_dte <= max_dte:
+        figure.add_vline(
+            x=earnings_dte,
+            line={"color": "#dc2626", "width": 2, "dash": "dot"},
+        )
+        figure.add_annotation(
+            x=earnings_dte,
+            y=0,
+            xref="x",
+            yref="paper",
+            text=earnings_label or "Earnings",
+            showarrow=False,
+            align="center",
+            xanchor="left",
+            xshift=8,
+            yanchor="bottom",
+            bgcolor="rgba(255,255,255,0.75)",
+            borderpad=4,
+            font={"color": "#dc2626"},
+        )
+
+    figure.update_layout(
+        title=f"{option_type.title()} IV term structures",
+        xaxis={
+            "title": "Days to expiration",
+            "unifiedhovertitle": {"text": "DTE: %{x}"},
+        },
+        yaxis_title="Implied volatility (%)",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.12, "x": 0},
+        margin={"l": 50, "r": 25, "t": 85, "b": 50},
+        height=520,
+    )
+    return figure
+
+
+def pair_heatmap_figure(pairs: pd.DataFrame, metric_key: str) -> go.Figure:
+    metric = METRICS[metric_key]
+    front_order = (
+        pairs[["front_expiry", "front_dte"]]
+        .drop_duplicates()
+        .sort_values("front_dte")
+    )
+    back_order = (
+        pairs[["back_expiry", "back_dte"]]
+        .drop_duplicates()
+        .sort_values("back_dte")
+    )
+    front_labels = [
+        _expiry_label(row.front_expiry, row.front_dte) for row in front_order.itertuples()
+    ]
+    back_labels = [
+        _expiry_label(row.back_expiry, row.back_dte) for row in back_order.itertuples()
+    ]
+    front_lookup = {
+        row.front_expiry: _expiry_label(row.front_expiry, row.front_dte)
+        for row in front_order.itertuples()
+    }
+    back_lookup = {
+        row.back_expiry: _expiry_label(row.back_expiry, row.back_dte)
+        for row in back_order.itertuples()
+    }
+
+    working = pairs.copy()
+    working["front_label"] = working["front_expiry"].map(front_lookup)
+    working["back_label"] = working["back_expiry"].map(back_lookup)
+    matrix = working.pivot(index="front_label", columns="back_label", values=metric.column)
+    matrix = matrix.reindex(index=front_labels, columns=back_labels)
+
+    finite_values = matrix.to_numpy(dtype=float)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    positive_values = finite_values[finite_values > 0]
+    bound = float(np.max(positive_values)) if positive_values.size else 1.0
+    if bound == 0:
+        bound = 1.0
+
+    figure = go.Figure(
+        go.Heatmap(
+            z=matrix.to_numpy(dtype=float),
+            x=matrix.columns.tolist(),
+            y=matrix.index.tolist(),
+            texttemplate=f"%{{z:.{metric.decimals}f}}",
+            textfont={"size": 11},
+            hovertemplate="%{y} → %{x}<br>%{z}<extra></extra>",
+            colorbar={"title": metric.label},
+            hoverongaps=False,
+            colorscale=[
+                [0.0, "#ffffff"],
+                [1.0, "#00b050"],
+            ],
+            autocolorscale=False,
+            reversescale=False,
+            zmin=0,
+            zmax=bound,
+        )
+    )
+    figure.update_layout(
+        title=metric.label,
+        xaxis_title="Back expiration",
+        yaxis_title="Front expiration",
+        xaxis={"side": "top", "tickangle": -45},
+        yaxis={"autorange": "reversed"},
+        margin={"l": 110, "r": 60, "t": 120, "b": 40},
+        height=520,
+    )
+    return figure
+
+
+def historical_volatility_figure(
+    hv: pd.DataFrame, current_30d_iv: float | None = None
+) -> go.Figure:
+    figure = go.Figure()
+    series_colors = (
+        ("HV5", "#dc2626"),
+        ("HV10", "#2563eb"),
+        ("HV20", "#f59e0b"),
+        ("HV30", "#16a34a"),
+        ("HV50", "#9333ea"),
+        ("HV100", "#0891b2"),
+    )
+    for column, color in series_colors:
+        initially_visible = column in {"HV10", "HV20"}
+        figure.add_trace(
+            go.Scatter(
+                x=hv.index,
+                y=hv[column],
+                mode="lines",
+                name=column,
+                line={"color": color, "width": 2},
+                visible=True if initially_visible else "legendonly",
+                hovertemplate=f"{column}: %{{y:.2f}}%<extra></extra>",
+            )
+        )
+    if current_30d_iv is not None and not hv.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=[hv.index.min(), hv.index.max()],
+                y=[current_30d_iv, current_30d_iv],
+                mode="lines",
+                name="Current 30d IV",
+                line={"color": "#000000", "width": 2, "dash": "dash"},
+                showlegend=False,
+                hovertemplate="Current 30d IV: %{y:.2f}%<extra></extra>",
+            )
+        )
+        midpoint = hv.index.min() + (hv.index.max() - hv.index.min()) / 2
+        figure.add_annotation(
+            x=midpoint,
+            y=current_30d_iv,
+            text=f"Current 30d IV: {current_30d_iv:.2f}%",
+            showarrow=False,
+            xanchor="center",
+            yanchor="bottom",
+            bgcolor="rgba(255,255,255,0.75)",
+            borderpad=4,
+            font={"color": "#000000"},
+        )
+    figure.update_layout(
+        title="Historical realized volatility",
+        xaxis_title=None,
+        yaxis_title="Annualized volatility (%)",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.12, "x": 0},
+        margin={"l": 50, "r": 25, "t": 85, "b": 40},
+        height=520,
+    )
+    return figure
+
+
+# Streamlit page
 
 
 DEFAULT_MAX_DTE = 60
