@@ -88,6 +88,8 @@ class OptionLeg:
     model_iv: float
     volume: float
     open_interest: float
+    calculated_iv: float = 0.30
+    iv_source: str = "Yahoo"
     quote_source: str = "midpoint"
     multiplier: int = CONTRACT_MULTIPLIER
 
@@ -193,6 +195,10 @@ def signed_iv(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+def iv_text(value: float) -> str:
+    return signed_iv(value) if math.isfinite(value) else "—"
+
+
 def query_text(name: str, default: str = "") -> str:
     """Read one persisted page value without exposing query API quirks."""
     value = st.query_params.get(name, default)
@@ -223,6 +229,8 @@ def reset_position_defaults(context_key: str) -> None:
         f"strike_slider_{context_key}_",
         f"strike_mode_{context_key}_",
         f"chart_range_{context_key}_",
+        f"front_iv_value_{context_key}_",
+        f"back_iv_value_{context_key}_",
     )
     exact_state_keys = {
         f"front_iv_value_{context_key}",
@@ -236,7 +244,7 @@ def reset_position_defaults(context_key: str) -> None:
     for key in list(st.query_params):
         if key.startswith("strike_") and key != "strike_view":
             del st.query_params[key]
-        elif key in {"front_iv", "back_iv"}:
+        elif key.startswith(("front_iv", "back_iv")):
             del st.query_params[key]
 
 
@@ -459,7 +467,7 @@ def normalize_chain(
     dividend_yield: float,
     valuation_date: date,
 ) -> pd.DataFrame:
-    """Add midpoint, canonical model IV, delta and quote-quality fields."""
+    """Cache Yahoo and locally calculated IV candidates plus their deltas."""
     result = frame.copy()
     time_years = years_between(valuation_date, expiration)
     records: list[dict[str, object]] = []
@@ -482,8 +490,32 @@ def normalize_chain(
         solved_iv = solve_implied_volatility(
             observed, spot, float(row["strike"]), time_years, rate, dividend_yield, option_type
         )
-        model_iv = solved_iv or (yahoo_iv if yahoo_iv > MIN_VOLATILITY else 0.30)
-        greek = bsm_greeks(spot, float(row["strike"]), time_years, rate, dividend_yield, model_iv, option_type)
+        yahoo_effective_iv = (
+            yahoo_iv
+            if yahoo_iv > MIN_VOLATILITY
+            else (solved_iv if solved_iv is not None else 0.30)
+        )
+        calculated_effective_iv = (
+            solved_iv if solved_iv is not None else yahoo_effective_iv
+        )
+        yahoo_greek = bsm_greeks(
+            spot,
+            float(row["strike"]),
+            time_years,
+            rate,
+            dividend_yield,
+            yahoo_effective_iv,
+            option_type,
+        )
+        calculated_greek = bsm_greeks(
+            spot,
+            float(row["strike"]),
+            time_years,
+            rate,
+            dividend_yield,
+            calculated_effective_iv,
+            option_type,
+        )
         midpoint = (bid + ask) / 2.0 if valid_market else observed
         spread_ratio = (ask - bid) / midpoint if valid_market and midpoint > 0 else math.inf
         warnings: list[str] = []
@@ -497,8 +529,11 @@ def normalize_chain(
         open_interest = finite_float(row.get("openInterest"), 0.0)
         if volume < LOW_VOLUME and open_interest < LOW_OPEN_INTEREST:
             warnings.append("low activity")
-        if solved_iv is not None and yahoo_iv > 0 and abs(solved_iv - yahoo_iv) > 0.10:
-            warnings.append("IV discrepancy")
+        iv_discrepancy = (
+            solved_iv is not None
+            and yahoo_iv > MIN_VOLATILITY
+            and abs(solved_iv - yahoo_iv) > 0.10
+        )
         records.append(
             {
                 **row,
@@ -507,15 +542,51 @@ def normalize_chain(
                 "lastPrice": last,
                 "marketMid": midpoint,
                 "yahooIV": yahoo_iv,
-                "modelIV": model_iv,
-                "delta": greek["delta"],
+                "yahooEffectiveIV": yahoo_effective_iv,
+                "calculatedIV": solved_iv if solved_iv is not None else np.nan,
+                "calculatedEffectiveIV": calculated_effective_iv,
+                "yahooDelta": yahoo_greek["delta"],
+                "calculatedDelta": calculated_greek["delta"],
+                "modelIV": yahoo_effective_iv,
+                "delta": yahoo_greek["delta"],
                 "volume": volume,
                 "openInterest": open_interest,
                 "quoteSource": source,
+                "baseWarning": ", ".join(warnings),
+                "ivDiscrepancy": iv_discrepancy,
                 "warning": ", ".join(warnings),
+                "ivSource": "Yahoo",
             }
         )
     return pd.DataFrame.from_records(records).sort_values("strike").reset_index(drop=True)
+
+
+def apply_iv_source(frame: pd.DataFrame, iv_source: str) -> pd.DataFrame:
+    """Activate one cached IV candidate without repeating local IV solves."""
+    result = frame.copy()
+    use_calculated = iv_source == "Calculated"
+    result["modelIV"] = result[
+        "calculatedEffectiveIV" if use_calculated else "yahooEffectiveIV"
+    ]
+    result["delta"] = result[
+        "calculatedDelta" if use_calculated else "yahooDelta"
+    ]
+    result["ivSource"] = iv_source
+
+    warnings: list[str] = []
+    for row in result.to_dict("records"):
+        parts = [part for part in str(row.get("baseWarning", "")).split(", ") if part]
+        if use_calculated and bool(row.get("ivDiscrepancy", False)):
+            parts.append("IV discrepancy")
+        if use_calculated and not math.isfinite(
+            finite_float(row.get("calculatedIV"), math.nan)
+        ):
+            parts.append("calculated IV unavailable")
+        if not use_calculated and finite_float(row.get("yahooIV"), 0.0) <= MIN_VOLATILITY:
+            parts.append("Yahoo IV unavailable")
+        warnings.append(", ".join(parts))
+    result["warning"] = warnings
+    return result
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -589,6 +660,8 @@ def leg_from_chain(
         model_iv=max(finite_float(row["modelIV"], 0.30), MIN_VOLATILITY),
         volume=finite_float(row["volume"]),
         open_interest=finite_float(row["openInterest"]),
+        calculated_iv=finite_float(row["calculatedIV"], math.nan),
+        iv_source=str(row["ivSource"]),
         quote_source=str(row["quoteSource"]),
     )
 
@@ -1689,6 +1762,16 @@ def quote_warnings(leg: OptionLeg) -> list[str]:
         warnings.append("wide spread")
     if leg.volume < LOW_VOLUME and leg.open_interest < LOW_OPEN_INTEREST:
         warnings.append("low activity")
+    if leg.iv_source == "Calculated":
+        if not math.isfinite(leg.calculated_iv):
+            warnings.append("calculated IV unavailable")
+        elif (
+            leg.yahoo_iv > MIN_VOLATILITY
+            and abs(leg.calculated_iv - leg.yahoo_iv) > 0.10
+        ):
+            warnings.append("IV discrepancy")
+    elif leg.yahoo_iv <= MIN_VOLATILITY:
+        warnings.append("Yahoo IV unavailable")
     if leg.quote_source != "midpoint":
         warnings.append(leg.quote_source)
     return warnings
@@ -1887,6 +1970,17 @@ def main() -> None:
             key="strategy_selection",
         )
         with st.expander("Advanced settings"):
+            saved_iv_source = query_text("iv_source", "Yahoo")
+            iv_source = st.selectbox(
+                "Implied volatility source",
+                ["Yahoo", "Calculated"],
+                index=1 if saved_iv_source == "Calculated" else 0,
+                help=(
+                    "Yahoo is the default. Calculated IV is locally solved "
+                    "from the option midpoint when available."
+                ),
+                key="iv_source_selection",
+            )
             use_right_metrics_panel = st.toggle(
                 "Right-side metrics panel",
                 value=True,
@@ -1911,6 +2005,7 @@ def main() -> None:
             )
     persist_query_value("ticker", symbol)
     persist_query_value("strategy", strategy)
+    persist_query_value("iv_source", iv_source)
     try:
         market_ready_key = f"market_ready_{symbol}"
         if st.session_state.get(market_ready_key):
@@ -2007,6 +2102,8 @@ def main() -> None:
                 dividend_yield=dividend_yield,
                 valuation_date_iso=today.isoformat(),
             )
+            calls = apply_iv_source(calls, iv_source)
+            puts = apply_iv_source(puts, iv_source)
             if calls.empty or puts.empty:
                 raise ValueError(
                     f"The {expiration:%Y-%m-%d} chain was incomplete."
@@ -2171,6 +2268,9 @@ def main() -> None:
         if is_time_spread
         else "Implied Volatility (IV)"
     )
+    iv_source_key = iv_source.lower()
+    front_iv_query_key = f"front_iv_{iv_source_key}"
+    back_iv_query_key = f"back_iv_{iv_source_key}"
 
     with main_view:
         st.divider()
@@ -2191,7 +2291,7 @@ def main() -> None:
         )
     with control_mid:
         saved_front_iv = (
-            query_float("front_iv", front_starting_iv * 100.0)
+            query_float(front_iv_query_key, front_starting_iv * 100.0)
             if same_persisted_context
             else front_starting_iv * 100.0
         )
@@ -2203,7 +2303,7 @@ def main() -> None:
             step=0.1,
             format="%.1f",
             help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-            key=f"front_iv_value_{context_key}",
+            key=f"front_iv_value_{context_key}_{iv_source_key}",
         )
         front_iv_points = front_iv_percent - front_starting_iv * 100.0
     if control_right is not None:
@@ -2212,7 +2312,7 @@ def main() -> None:
                 selected_legs, back_expiration
             )
             saved_back_iv = (
-                query_float("back_iv", back_starting_iv * 100.0)
+                query_float(back_iv_query_key, back_starting_iv * 100.0)
                 if same_persisted_context
                 else back_starting_iv * 100.0
             )
@@ -2224,15 +2324,15 @@ def main() -> None:
                 step=0.1,
                 format="%.1f",
                 help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-                key=f"back_iv_value_{context_key}",
+                key=f"back_iv_value_{context_key}_{iv_source_key}",
             )
             back_iv_points = back_iv_percent - back_starting_iv * 100.0
     else:
         back_iv_points = front_iv_points
 
-    persist_query_value("front_iv", f"{front_iv_percent:g}")
+    persist_query_value(front_iv_query_key, f"{front_iv_percent:g}")
     if control_right is not None:
-        persist_query_value("back_iv", f"{back_iv_percent:g}")
+        persist_query_value(back_iv_query_key, f"{back_iv_percent:g}")
 
     with main_view:
         if front_expiration > today:
@@ -2350,8 +2450,10 @@ def main() -> None:
                         "Ask": leg.ask,
                         "Last": leg.last,
                         "Mid": leg.market_mid,
-                        "Yahoo IV": signed_iv(leg.yahoo_iv),
-                        "Model IV": signed_iv(leg.model_iv),
+                        "Yahoo IV": iv_text(leg.yahoo_iv),
+                        "Calculated IV": iv_text(leg.calculated_iv),
+                        "Active IV": iv_text(leg.model_iv),
+                        "IV source": leg.iv_source,
                         "Volume": int(leg.volume),
                         "Open interest": int(leg.open_interest),
                         "Quote source": leg.quote_source,
@@ -2359,7 +2461,11 @@ def main() -> None:
                     }
                 )
             st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
-            st.caption("Model IV is locally solved from the midpoint when possible; Yahoo IV is retained as a reference and fallback.")
+            st.caption(
+                "Yahoo IV is the default pricing source. Calculated IV is "
+                "locally solved from the midpoint and falls back when a valid "
+                "solution is unavailable."
+            )
 
     with main_view:
         st.caption(f"Quotes received {market.retrieved_at:%b %d, %I:%M %p %Z}.")
