@@ -193,6 +193,53 @@ def signed_iv(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+def query_text(name: str, default: str = "") -> str:
+    """Read one persisted page value without exposing query API quirks."""
+    value = st.query_params.get(name, default)
+    if isinstance(value, list):
+        value = value[-1] if value else default
+    return str(value)
+
+
+def query_float(name: str, default: float) -> float:
+    try:
+        return float(query_text(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def persist_query_value(name: str, value: object) -> None:
+    """Persist interactive setup state in the URL for browser refreshes."""
+    text_value = str(value)
+    if query_text(name) != text_value:
+        st.query_params[name] = text_value
+
+
+def reset_position_defaults(context_key: str) -> None:
+    """Clear current-position values while preserving view preferences."""
+    state_prefixes = (
+        f"strike_value_{context_key}_",
+        f"strike_list_{context_key}_",
+        f"strike_slider_{context_key}_",
+        f"strike_mode_{context_key}_",
+        f"chart_range_{context_key}_",
+    )
+    exact_state_keys = {
+        f"front_iv_value_{context_key}",
+        f"back_iv_value_{context_key}",
+        f"simulation_date_{context_key}",
+    }
+    for key in list(st.session_state):
+        if key in exact_state_keys or key.startswith(state_prefixes):
+            del st.session_state[key]
+
+    for key in list(st.query_params):
+        if key.startswith("strike_") and key != "strike_view":
+            del st.query_params[key]
+        elif key in {"front_iv", "back_iv"}:
+            del st.query_params[key]
+
+
 # ============================================================
 # YAHOO MARKET DATA
 # ============================================================
@@ -624,20 +671,26 @@ def default_leg_specs(
     back_calls = chain_for_type(chains, back_expiration, "call")
     back_puts = chain_for_type(chains, back_expiration, "put")
     if strategy == "Call Calendar / Diagonal":
-        strike = nearest_atm(calls, spot)
-        return [("call", -1, front_expiration, strike), ("call", 1, back_expiration, strike)]
+        strike = nearest_delta(calls, 0.20)
+        return [
+            ("call", -1, front_expiration, strike),
+            ("call", 1, back_expiration, nearest_strike(back_calls, strike)),
+        ]
     if strategy == "Put Calendar / Diagonal":
-        strike = nearest_atm(puts, spot)
-        return [("put", -1, front_expiration, strike), ("put", 1, back_expiration, strike)]
+        strike = nearest_delta(puts, 0.20)
+        return [
+            ("put", -1, front_expiration, strike),
+            ("put", 1, back_expiration, nearest_strike(back_puts, strike)),
+        ]
     if strategy == "Double Calendar / Diagonal":
-        # Define the structure from the front-expiry 30-delta wings, then
+        # Define the structure from the front-expiry 20-delta wings, then
         # vertically align the back legs by strike whenever the listing allows.
-        put_strike = nearest_delta(puts, 0.30)
-        call_strike = nearest_delta(calls, 0.30)
+        put_strike = nearest_delta(puts, 0.20)
+        call_strike = nearest_delta(calls, 0.20)
         return [
             ("put", -1, front_expiration, put_strike),
-            ("call", -1, front_expiration, call_strike),
             ("put", 1, back_expiration, nearest_strike(back_puts, put_strike)),
+            ("call", -1, front_expiration, call_strike),
             ("call", 1, back_expiration, nearest_strike(back_calls, call_strike)),
         ]
     raise ValueError(f"Unsupported strategy: {strategy}")
@@ -1469,13 +1522,42 @@ def build_pnl_figure(
 # STRIKE SELECTOR AND DISPLAY HELPERS
 # ============================================================
 
+def synchronize_anchored_strike(
+    source_widget_key: str,
+    source_canonical_key: str,
+    source_query_key: str,
+    target_widget_key: str,
+    target_canonical_key: str,
+    target_query_key: str,
+    target_strikes: tuple[float, ...],
+    anchor_state_key: str,
+) -> None:
+    """Synchronize a paired strike before Streamlit begins its rerun."""
+    source_strike = float(st.session_state[source_widget_key])
+    st.session_state[source_canonical_key] = source_strike
+    persist_query_value(source_query_key, f"{source_strike:g}")
+    if not st.session_state.get(anchor_state_key, False):
+        return
+
+    target_strike = min(
+        target_strikes, key=lambda strike: abs(strike - source_strike)
+    )
+    st.session_state[target_canonical_key] = target_strike
+    st.session_state[target_widget_key] = target_strike
+    persist_query_value(target_query_key, f"{target_strike:g}")
+
+
 def render_strike_selector(
     leg: OptionLeg,
     leg_index: int,
     frame: pd.DataFrame,
     context_key: str,
+    view_mode: str,
+    initial_strike: float,
+    anchor_target_index: int | None = None,
+    anchor_target_strikes: tuple[float, ...] = (),
+    anchor_state_key: str = "",
 ) -> float:
-    header = st.empty()
     all_strikes = sorted(frame["strike"].astype(float).unique())
     option_labels: dict[float, str] = {}
     for strike in all_strikes:
@@ -1484,21 +1566,107 @@ def render_strike_selector(
             f"${strike:,.2f}  ·  Δ {finite_float(option_row['delta']):+.2f}"
             f"  ·  IV {signed_iv(finite_float(option_row['modelIV']))}"
         )
-    default_strike = min(all_strikes, key=lambda item: abs(item - leg.strike))
-    selected = st.selectbox(
-        "Strike",
-        options=all_strikes,
-        index=all_strikes.index(default_strike),
-        format_func=lambda item: option_labels[item],
-        key=f"strike_dropdown_{context_key}_{leg_index}",
-        label_visibility="collapsed",
+    canonical_key = f"strike_value_{context_key}_{leg_index}"
+    mode_key = f"strike_mode_{context_key}_{leg_index}"
+    if canonical_key not in st.session_state:
+        st.session_state[canonical_key] = min(
+            all_strikes, key=lambda item: abs(item - initial_strike)
+        )
+    elif float(st.session_state[canonical_key]) not in all_strikes:
+        st.session_state[canonical_key] = min(
+            all_strikes,
+            key=lambda item: abs(item - float(st.session_state[canonical_key])),
+        )
+
+    widget_kind = "list" if view_mode == "List view" else "slider"
+    widget_key = f"strike_{widget_kind}_{context_key}_{leg_index}"
+    rebuild_widget = (
+        widget_key not in st.session_state
+        or st.session_state.get(mode_key) != view_mode
+        or (
+            widget_key in st.session_state
+            and float(st.session_state[widget_key]) not in all_strikes
+        )
     )
+    if rebuild_widget and widget_key in st.session_state:
+        # Let the widget receive an explicit default below. Preloading its key
+        # and omitting index/value can race with Streamlit's widget restoration
+        # and silently select the first (lowest) strike.
+        del st.session_state[widget_key]
+    st.session_state[mode_key] = view_mode
+    canonical_strike = float(st.session_state[canonical_key])
+    change_callback: dict[str, object] = {}
+    if anchor_target_index is not None and anchor_target_strikes:
+        target_widget_key = (
+            f"strike_{widget_kind}_{context_key}_{anchor_target_index}"
+        )
+        change_callback = {
+            "on_change": synchronize_anchored_strike,
+            "args": (
+                widget_key,
+                canonical_key,
+                f"strike_{leg_index}",
+                target_widget_key,
+                f"strike_value_{context_key}_{anchor_target_index}",
+                f"strike_{anchor_target_index}",
+                anchor_target_strikes,
+                anchor_state_key,
+            ),
+        }
+
+    # Render the heading in its final position before creating the widget.
+    # A prior st.empty() placeholder was filled only after the selector was
+    # created, causing the control row to shift visibly on every app rerun.
+    displayed_strike = (
+        canonical_strike
+        if rebuild_widget
+        else float(st.session_state.get(widget_key, canonical_strike))
+    )
+    displayed_row = row_for_strike(frame, displayed_strike)
+    displayed_warning_value = displayed_row.get("warning", "")
+    displayed_warning = (
+        str(displayed_warning_value).strip()
+        if pd.notna(displayed_warning_value)
+        else ""
+    )
+    displayed_icon = " ⚠" if displayed_warning else ""
+    st.markdown(
+        f"**{leg.label} · {leg.expiration:%b %d, %Y}{displayed_icon}**"
+    )
+
+    if view_mode == "List view":
+        list_defaults = (
+            {"index": all_strikes.index(canonical_strike)}
+            if rebuild_widget
+            else {}
+        )
+        selected = st.selectbox(
+            "Strike",
+            options=all_strikes,
+            format_func=lambda item: option_labels[item],
+            key=widget_key,
+            label_visibility="collapsed",
+            **list_defaults,
+            **change_callback,
+        )
+    else:
+        slider_defaults = (
+            {"value": canonical_strike} if rebuild_widget else {}
+        )
+        selected = st.select_slider(
+            "Strike",
+            options=all_strikes,
+            format_func=lambda item: option_labels[item],
+            key=widget_key,
+            label_visibility="collapsed",
+            **slider_defaults,
+            **change_callback,
+        )
     selected = float(selected)
+    st.session_state[canonical_key] = selected
     row = row_for_strike(frame, selected)
     warning_value = row.get("warning", "")
     warning = str(warning_value).strip() if pd.notna(warning_value) else ""
-    icon = " ⚠" if warning else ""
-    header.markdown(f"**{leg.label} · {leg.expiration:%b %d, %Y}{icon}**")
     bid_text = price_text(finite_float(row["bid"])).replace("$", r"\$")
     ask_text = price_text(finite_float(row["ask"])).replace("$", r"\$")
     detail = (
@@ -1654,7 +1822,13 @@ def app_styles() -> None:
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 2rem; max-width: 1500px;}
+        .block-container {
+            max-width: none;
+            padding-left: clamp(1.25rem, 2.5vw, 3rem);
+            padding-right: clamp(1.25rem, 2.5vw, 3rem);
+            padding-top: 2rem;
+            width: 100%;
+        }
         [data-testid="stMetric"] {background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: .7rem .85rem;}
         [data-testid="stMetricLabel"] {font-size: .78rem; color: #64748b;}
         [data-testid="stMetricValue"] {font-size: 1.25rem;}
@@ -1688,18 +1862,29 @@ def app_styles() -> None:
 def main() -> None:
     app_styles()
 
+    persisted_symbol = query_text("ticker", "SPY").strip().upper() or "SPY"
     with st.sidebar:
         st.header("Position setup")
         with st.form("symbol_form", border=False):
-            requested_symbol = st.text_input("Ticker", value=st.session_state.get("loaded_symbol", "SPY")).strip().upper()
+            requested_symbol = st.text_input(
+                "Ticker",
+                value=st.session_state.get("loaded_symbol", persisted_symbol),
+            ).strip().upper()
             load_clicked = st.form_submit_button("Load ticker", type="primary", use_container_width=True)
         if load_clicked or "loaded_symbol" not in st.session_state:
-            st.session_state["loaded_symbol"] = requested_symbol or "SPY"
+            st.session_state["loaded_symbol"] = requested_symbol or persisted_symbol
         symbol = str(st.session_state["loaded_symbol"])
+        persisted_strategy = query_text("strategy", "Short Strangle")
+        strategy_index = (
+            ALL_STRATEGIES.index(persisted_strategy)
+            if persisted_strategy in ALL_STRATEGIES
+            else ALL_STRATEGIES.index("Short Strangle")
+        )
         strategy = st.selectbox(
             "Strategy",
             ALL_STRATEGIES,
-            index=ALL_STRATEGIES.index("Short Strangle"),
+            index=strategy_index,
+            key="strategy_selection",
         )
         with st.expander("Advanced settings"):
             use_right_metrics_panel = st.toggle(
@@ -1724,9 +1909,16 @@ def main() -> None:
                 step=0.05,
                 disabled=not dividend_override,
             )
+    persist_query_value("ticker", symbol)
+    persist_query_value("strategy", strategy)
     try:
-        with st.spinner(f"Loading {symbol} market information…"):
+        market_ready_key = f"market_ready_{symbol}"
+        if st.session_state.get(market_ready_key):
             market = load_market_context(symbol)
+        else:
+            with st.spinner(f"Loading {symbol} market information…"):
+                market = load_market_context(symbol)
+            st.session_state[market_ready_key] = True
     except Exception as exc:
         st.error(f"Could not load options for {symbol}. Check the ticker or try again shortly.")
         with st.expander("Technical detail"):
@@ -1744,10 +1936,23 @@ def main() -> None:
     is_time_spread = strategy in TIME_SPREAD_STRATEGIES
 
     with st.sidebar:
-        front_index = nearest_expiration_index(
-            valid_expirations,
-            today,
-            DEFAULT_FRONT_DTE,
+        saved_front_iso = query_text("front_expiration")
+        saved_front = next(
+            (
+                expiration
+                for expiration in valid_expirations
+                if expiration.isoformat() == saved_front_iso
+            ),
+            None,
+        )
+        front_index = (
+            valid_expirations.index(saved_front)
+            if saved_front is not None
+            else nearest_expiration_index(
+                valid_expirations,
+                today,
+                DEFAULT_FRONT_DTE,
+            )
         )
         front_expiration = st.selectbox(
             "Expiration" if not is_time_spread else "Front expiration",
@@ -1761,40 +1966,74 @@ def main() -> None:
             if not back_choices:
                 st.warning("Choose an earlier front expiration to create a time spread.")
                 return
-            back_expiration = st.selectbox(
-                "Back expiration",
-                back_choices,
-                index=nearest_expiration_index(
+            saved_back_iso = query_text("back_expiration")
+            saved_back = next(
+                (
+                    expiration
+                    for expiration in back_choices
+                    if expiration.isoformat() == saved_back_iso
+                ),
+                None,
+            )
+            back_index = (
+                back_choices.index(saved_back)
+                if saved_back is not None
+                else nearest_expiration_index(
                     back_choices,
                     today,
                     DEFAULT_BACK_DTE,
-                ),
+                )
+            )
+            back_expiration = st.selectbox(
+                "Back expiration",
+                back_choices,
+                index=back_index,
                 format_func=lambda item: f"{item:%b %d, %Y} · {(item - today).days} DTE",
             )
+    persist_query_value("front_expiration", front_expiration.isoformat())
+    if back_expiration is not None:
+        persist_query_value("back_expiration", back_expiration.isoformat())
 
     required_expirations = [front_expiration] + ([back_expiration] if back_expiration else [])
-    chains: dict[date, dict[str, pd.DataFrame]] = {}
-    try:
-        with st.spinner("Loading selected option chain…"):
-            for expiration in required_expirations:
-                calls, puts = load_prepared_option_chain(
-                    symbol=symbol,
-                    expiration_iso=expiration.isoformat(),
-                    spot=market.spot,
-                    rate=rate,
-                    dividend_yield=dividend_yield,
-                    valuation_date_iso=today.isoformat(),
+
+    def prepared_chains() -> dict[date, dict[str, pd.DataFrame]]:
+        result: dict[date, dict[str, pd.DataFrame]] = {}
+        for expiration in required_expirations:
+            calls, puts = load_prepared_option_chain(
+                symbol=symbol,
+                expiration_iso=expiration.isoformat(),
+                spot=market.spot,
+                rate=rate,
+                dividend_yield=dividend_yield,
+                valuation_date_iso=today.isoformat(),
+            )
+            if calls.empty or puts.empty:
+                raise ValueError(
+                    f"The {expiration:%Y-%m-%d} chain was incomplete."
                 )
-                if calls.empty or puts.empty:
-                    raise ValueError(f"The {expiration:%Y-%m-%d} chain was incomplete.")
-                chains[expiration] = {"call": calls, "put": puts}
+            result[expiration] = {"call": calls, "put": puts}
+        return result
+
+    try:
+        chain_ready_key = (
+            f"chain_ready_{symbol}_{front_expiration}_{back_expiration}_"
+            f"{rate:.6f}_{dividend_yield:.6f}"
+        )
+        if st.session_state.get(chain_ready_key):
+            chains = prepared_chains()
+        else:
+            with st.spinner("Loading selected option chain…"):
+                chains = prepared_chains()
+            st.session_state[chain_ready_key] = True
     except Exception as exc:
         st.error("The selected option chain could not be loaded. Yahoo may be temporarily unavailable.")
         with st.expander("Technical detail"):
             st.code(str(exc))
         return
 
-    context_key = f"{symbol}_{strategy}_{front_expiration}_{back_expiration}"
+    # Version the persisted setup because strike slots are positional and the
+    # double-diagonal display order changed in this release.
+    context_key = f"v3_{symbol}_{strategy}_{front_expiration}_{back_expiration}"
     try:
         specifications = default_leg_specs(strategy, chains, front_expiration, back_expiration, market.spot)
         default_legs = [leg_from_chain(chains, option_type, side, expiration, strike) for option_type, side, expiration, strike in specifications]
@@ -1812,17 +2051,99 @@ def main() -> None:
         main_view = st.container()
         metrics_view = None
 
+    anchor_widget_key = f"anchor_pairs_{context_key}"
     with main_view:
         st.markdown(f"### {symbol} · {price_text(market.spot)}")
         st.markdown(f"#### {strategy}")
+        strike_settings = st.columns([1, 1, 0.55])
+        with strike_settings[0]:
+            saved_view = query_text("strike_view", "List view")
+            strike_view = st.radio(
+                "Strike view",
+                ["List view", "Slider view"],
+                index=0 if saved_view != "Slider view" else 1,
+                horizontal=True,
+                key="strike_view_selection",
+                label_visibility="collapsed",
+            )
+        with strike_settings[1]:
+            if is_time_spread:
+                anchor_pairs = st.checkbox(
+                    "Anchor Short/Long pairs",
+                    value=(
+                        query_text("anchor_pairs", "false").lower() == "true"
+                        if query_text("position_context") == context_key
+                        else False
+                    ),
+                    key=anchor_widget_key,
+                    help=(
+                        "Keep each short and long pair at the same strike, or "
+                        "the closest strike available in the other expiration."
+                    ),
+                )
+            else:
+                anchor_pairs = False
+        with strike_settings[2]:
+            st.button(
+                "Reset defaults",
+                key=f"reset_defaults_{context_key}",
+                on_click=reset_position_defaults,
+                args=(context_key,),
+                help=(
+                    "Restore strategy strikes, starting IV, chart range, and "
+                    "the default simulation date."
+                ),
+                use_container_width=True,
+            )
         columns = st.columns(min(len(default_legs), 4))
 
+    persist_query_value("strike_view", strike_view)
+    persist_query_value("anchor_pairs", str(anchor_pairs).lower())
+    same_persisted_context = query_text("position_context") == context_key
     selected_legs: list[OptionLeg] = []
     for index, leg in enumerate(default_legs):
         with columns[index % len(columns)]:
             frame = chain_for_type(chains, leg.expiration, leg.option_type)
-            selected_strike = render_strike_selector(leg, index, frame, context_key)
+            target_index = next(
+                (
+                    candidate_index
+                    for candidate_index, candidate in enumerate(default_legs)
+                    if candidate_index != index
+                    and candidate.option_type == leg.option_type
+                    and candidate.side == -leg.side
+                ),
+                None,
+            )
+            target_strikes: tuple[float, ...] = ()
+            if target_index is not None:
+                target_leg = default_legs[target_index]
+                target_frame = chain_for_type(
+                    chains, target_leg.expiration, target_leg.option_type
+                )
+                target_strikes = tuple(
+                    sorted(target_frame["strike"].astype(float).unique())
+                )
+            initial_strike = (
+                query_float(f"strike_{index}", leg.strike)
+                if same_persisted_context
+                else leg.strike
+            )
+            selected_strike = render_strike_selector(
+                leg,
+                index,
+                frame,
+                context_key,
+                strike_view,
+                initial_strike,
+                target_index,
+                target_strikes,
+                anchor_widget_key,
+            )
             selected_legs.append(leg_from_chain(chains, leg.option_type, leg.side, leg.expiration, selected_strike))
+
+    persist_query_value("position_context", context_key)
+    for index, leg in enumerate(selected_legs):
+        persist_query_value(f"strike_{index}", f"{leg.strike:g}")
 
     execution = execution_estimate(selected_legs)
     # The live strategy midpoint is the entry basis and updates automatically
@@ -1869,15 +2190,20 @@ def main() -> None:
             help="Defaults to about 3% beyond the outer expiration breakevens.",
         )
     with control_mid:
+        saved_front_iv = (
+            query_float("front_iv", front_starting_iv * 100.0)
+            if same_persisted_context
+            else front_starting_iv * 100.0
+        )
         front_iv_percent = st.number_input(
             front_iv_label,
             min_value=0.1,
             max_value=500.0,
-            value=max(float(front_starting_iv * 100.0), 0.1),
+            value=min(max(float(saved_front_iv), 0.1), 500.0),
             step=0.1,
             format="%.1f",
             help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-            key=f"front_iv_value_{context_key}_{strike_key}",
+            key=f"front_iv_value_{context_key}",
         )
         front_iv_points = front_iv_percent - front_starting_iv * 100.0
     if control_right is not None:
@@ -1885,19 +2211,28 @@ def main() -> None:
             back_starting_iv = average_starting_iv(
                 selected_legs, back_expiration
             )
+            saved_back_iv = (
+                query_float("back_iv", back_starting_iv * 100.0)
+                if same_persisted_context
+                else back_starting_iv * 100.0
+            )
             back_iv_percent = st.number_input(
                 "Back Implied Volatility (IV)",
                 min_value=0.1,
                 max_value=500.0,
-                value=max(float(back_starting_iv * 100.0), 0.1),
+                value=min(max(float(saved_back_iv), 0.1), 500.0),
                 step=0.1,
                 format="%.1f",
                 help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-                key=f"back_iv_value_{context_key}_{strike_key}",
+                key=f"back_iv_value_{context_key}",
             )
             back_iv_points = back_iv_percent - back_starting_iv * 100.0
     else:
         back_iv_points = front_iv_points
+
+    persist_query_value("front_iv", f"{front_iv_percent:g}")
+    if control_right is not None:
+        persist_query_value("back_iv", f"{back_iv_percent:g}")
 
     with main_view:
         if front_expiration > today:
@@ -1910,6 +2245,7 @@ def main() -> None:
                 value=default_simulation_date,
                 format="MMM D, YYYY",
                 help="Defaults to halfway between today and front expiration. At front expiry, front legs become intrinsic while back legs retain time value.",
+                key=f"simulation_date_{context_key}",
             )
         else:
             selected_date = today
