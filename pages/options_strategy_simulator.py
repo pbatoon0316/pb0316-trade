@@ -263,8 +263,8 @@ def persist_query_value(name: str, value: object) -> None:
         st.query_params[name] = text_value
 
 
-def reset_position_defaults(context_key: str) -> None:
-    """Clear current-position values while preserving view preferences."""
+def reset_strike_defaults(context_key: str) -> None:
+    """Restore strategy strike defaults without changing scenario controls."""
     state_prefixes = (
         f"strike_value_{context_key}_",
         f"strike_list_{context_key}_",
@@ -272,24 +272,28 @@ def reset_position_defaults(context_key: str) -> None:
         f"strike_mode_{context_key}_",
         f"strike_revision_{context_key}_",
         f"strike_variant_{context_key}_",
-        f"chart_range_{context_key}_",
-        f"front_iv_value_{context_key}_",
-        f"back_iv_value_{context_key}_",
     )
-    exact_state_keys = {
-        f"front_iv_value_{context_key}",
-        f"back_iv_value_{context_key}",
-        f"simulation_date_{context_key}",
-        f"anchor_active_{context_key}",
-    }
     for key in list(st.session_state):
-        if key in exact_state_keys or key.startswith(state_prefixes):
+        if key == f"anchor_active_{context_key}" or key.startswith(state_prefixes):
             del st.session_state[key]
 
     for key in list(st.query_params):
         if key.startswith("strike_") and key != "strike_view":
             del st.query_params[key]
-        elif key.startswith(("front_iv", "back_iv")):
+
+
+def reset_iv_defaults(context_key: str) -> None:
+    """Restore starting IV values without changing strikes or other controls."""
+    state_prefixes = (
+        f"front_iv_value_{context_key}",
+        f"back_iv_value_{context_key}",
+    )
+    for key in list(st.session_state):
+        if key.startswith(state_prefixes):
+            del st.session_state[key]
+
+    for key in list(st.query_params):
+        if key.startswith(("front_iv", "back_iv")):
             del st.query_params[key]
 
 
@@ -2402,14 +2406,11 @@ def main() -> None:
                 anchor_pairs = False
         with strike_settings[2]:
             st.button(
-                "Reset defaults",
-                key=f"reset_defaults_{context_key}",
-                on_click=reset_position_defaults,
+                "Reset strikes",
+                key=f"reset_strikes_{context_key}",
+                on_click=reset_strike_defaults,
                 args=(context_key,),
-                help=(
-                    "Restore strategy strikes, starting IV, chart range, and "
-                    "the default simulation date."
-                ),
+                help="Restore the strategy's initial strikes without changing IVs.",
                 use_container_width=True,
             )
         columns = st.columns(min(len(default_legs), 4))
@@ -2544,9 +2545,11 @@ def main() -> None:
     with main_view:
         st.divider()
         if is_time_spread:
-            range_column, control_mid, control_right = st.columns([0.8, 1, 1])
+            range_column, control_mid, control_right, reset_iv_column = st.columns(
+                [0.8, 1, 1, 0.55]
+            )
         else:
-            range_column, control_mid = st.columns([0.8, 1])
+            range_column, control_mid, reset_iv_column = st.columns([0.8, 1, 0.55])
             control_right = None
     with range_column:
         range_percent = st.number_input(
@@ -2596,6 +2599,16 @@ def main() -> None:
             back_iv_points = back_iv_percent - back_starting_iv * 100.0
     else:
         back_iv_points = front_iv_points
+
+    with reset_iv_column:
+        st.button(
+            "Reset IVs",
+            key=f"reset_ivs_{context_key}",
+            on_click=reset_iv_defaults,
+            args=(context_key,),
+            help="Restore the starting IV values without changing strikes.",
+            use_container_width=True,
+        )
 
     persist_query_value(front_iv_query_key, f"{front_iv_percent:g}")
     if control_right is not None:
