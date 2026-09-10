@@ -15,6 +15,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import GoodFriday
 import plotly.graph_objects as go
 from scipy.optimize import brentq
 from scipy.stats import norm
@@ -88,7 +89,7 @@ class OptionLeg:
     model_iv: float
     volume: float
     open_interest: float
-    calculated_iv: float = 0.30
+    calculated_iv: float = math.nan
     iv_source: str = "Yahoo"
     quote_source: str = "midpoint"
     multiplier: int = CONTRACT_MULTIPLIER
@@ -143,6 +144,7 @@ class AdvancedMetrics:
 # GENERIC UTILITIES
 # ============================================================
 
+
 def finite_float(value: object, default: float = 0.0) -> float:
     """Return a finite float or a controlled default."""
     try:
@@ -167,6 +169,46 @@ def nearest_expiration_index(
     return min(
         range(len(expirations)),
         key=lambda index: abs((expirations[index] - valuation_date).days - target_dte),
+    )
+
+
+def observed_fixed_holiday(year: int, month: int, day: int) -> date:
+    """Return the weekday on which a fixed-date US market holiday is observed."""
+    holiday = date(year, month, day)
+    if holiday.weekday() == 5:
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def standard_monthly_expiration(year: int, month: int) -> date:
+    """Return the actual standard monthly expiration, including holiday shifts."""
+    month_start = date(year, month, 1)
+    third_friday = month_start + timedelta(days=(4 - month_start.weekday()) % 7 + 14)
+    good_friday = GoodFriday.dates(
+        pd.Timestamp(year, 1, 1), pd.Timestamp(year, 12, 31)
+    )[0].date()
+    juneteenth = observed_fixed_holiday(year, 6, 19)
+    if third_friday in {good_friday, juneteenth}:
+        return third_friday - timedelta(days=1)
+    return third_friday
+
+
+def expiration_type(expiration: date) -> str:
+    """Classify listed expirations as standard monthly or nonstandard weekly."""
+    return (
+        "M"
+        if expiration == standard_monthly_expiration(expiration.year, expiration.month)
+        else "W"
+    )
+
+
+def expiration_label(expiration: date, valuation_date: date) -> str:
+    """Format an expiration with its contract type and current DTE."""
+    return (
+        f"{expiration:%b %d, %Y} ({expiration_type(expiration)}) · "
+        f"{(expiration - valuation_date).days} DTE"
     )
 
 
@@ -228,6 +270,8 @@ def reset_position_defaults(context_key: str) -> None:
         f"strike_list_{context_key}_",
         f"strike_slider_{context_key}_",
         f"strike_mode_{context_key}_",
+        f"strike_revision_{context_key}_",
+        f"strike_variant_{context_key}_",
         f"chart_range_{context_key}_",
         f"front_iv_value_{context_key}_",
         f"back_iv_value_{context_key}_",
@@ -236,6 +280,7 @@ def reset_position_defaults(context_key: str) -> None:
         f"front_iv_value_{context_key}",
         f"back_iv_value_{context_key}",
         f"simulation_date_{context_key}",
+        f"anchor_active_{context_key}",
     }
     for key in list(st.session_state):
         if key in exact_state_keys or key.startswith(state_prefixes):
@@ -252,6 +297,7 @@ def reset_position_defaults(context_key: str) -> None:
 # YAHOO MARKET DATA
 # ============================================================
 
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _load_market_context_payload(
     symbol: str,
@@ -266,7 +312,9 @@ def _load_market_context_payload(
     if spot <= 0:
         history = ticker.history(period="5d", auto_adjust=False)
         if history.empty:
-            raise ValueError(f"A current underlying price was not available for {symbol}.")
+            raise ValueError(
+                f"A current underlying price was not available for {symbol}."
+            )
         spot = finite_float(history["Close"].dropna().iloc[-1], -1.0)
     if spot <= 0:
         raise ValueError(f"A valid underlying price was not available for {symbol}.")
@@ -302,8 +350,7 @@ def load_market_context(symbol: str) -> MarketContext:
         symbol=cached_symbol,
         spot=spot,
         expirations=tuple(
-            datetime.strptime(item, "%Y-%m-%d").date()
-            for item in expiration_strings
+            datetime.strptime(item, "%Y-%m-%d").date() for item in expiration_strings
         ),
         dividend_yield=dividend_yield,
         retrieved_at=datetime.fromisoformat(retrieved_at),
@@ -311,12 +358,20 @@ def load_market_context(symbol: str) -> MarketContext:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_option_chain(symbol: str, expiration_iso: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_option_chain(
+    symbol: str, expiration_iso: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load exactly one option chain and retain the useful raw quote fields."""
     chain = yf.Ticker(symbol).option_chain(expiration_iso)
     columns = [
-        "contractSymbol", "strike", "bid", "ask", "lastPrice",
-        "impliedVolatility", "volume", "openInterest",
+        "contractSymbol",
+        "strike",
+        "bid",
+        "ask",
+        "lastPrice",
+        "impliedVolatility",
+        "volume",
+        "openInterest",
     ]
 
     def clean(frame: pd.DataFrame) -> pd.DataFrame:
@@ -337,9 +392,16 @@ def load_option_chain(symbol: str, expiration_iso: str) -> tuple[pd.DataFrame, p
 # BLACK-SCHOLES-MERTON PRICING AND GREEKS
 # ============================================================
 
-def intrinsic_value(spot: np.ndarray | float, strike: float, option_type: str) -> np.ndarray | float:
+
+def intrinsic_value(
+    spot: np.ndarray | float, strike: float, option_type: str
+) -> np.ndarray | float:
     values = np.asarray(spot, dtype=float)
-    payoff = np.maximum(values - strike, 0.0) if option_type == "call" else np.maximum(strike - values, 0.0)
+    payoff = (
+        np.maximum(values - strike, 0.0)
+        if option_type == "call"
+        else np.maximum(strike - values, 0.0)
+    )
     return float(payoff) if values.ndim == 0 else payoff
 
 
@@ -408,13 +470,23 @@ def bsm_greeks(
     discount_q = math.exp(-dividend_yield * time_years)
     discount_r = math.exp(-rate * time_years)
     density = norm.pdf(d1f)
-    common_theta = -(spot * discount_q * density * volatility) / (2.0 * math.sqrt(time_years))
+    common_theta = -(spot * discount_q * density * volatility) / (
+        2.0 * math.sqrt(time_years)
+    )
     if option_type == "call":
         delta = discount_q * norm.cdf(d1f)
-        theta_annual = common_theta - rate * strike * discount_r * norm.cdf(d2f) + dividend_yield * spot * discount_q * norm.cdf(d1f)
+        theta_annual = (
+            common_theta
+            - rate * strike * discount_r * norm.cdf(d2f)
+            + dividend_yield * spot * discount_q * norm.cdf(d1f)
+        )
     else:
         delta = discount_q * (norm.cdf(d1f) - 1.0)
-        theta_annual = common_theta + rate * strike * discount_r * norm.cdf(-d2f) - dividend_yield * spot * discount_q * norm.cdf(-d1f)
+        theta_annual = (
+            common_theta
+            + rate * strike * discount_r * norm.cdf(-d2f)
+            - dividend_yield * spot * discount_q * norm.cdf(-d1f)
+        )
     gamma = discount_q * density / (spot * volatility * math.sqrt(time_years))
     vega_per_point = spot * discount_q * density * math.sqrt(time_years) / 100.0
     return {
@@ -429,6 +501,7 @@ def bsm_greeks(
 # IMPLIED VOLATILITY AND CHAIN NORMALIZATION
 # ============================================================
 
+
 def solve_implied_volatility(
     observed_price: float,
     spot: float,
@@ -441,14 +514,33 @@ def solve_implied_volatility(
     """Invert BSM using a bounded Brent solver; return None when no valid root exists."""
     if observed_price <= 0 or time_years <= 0:
         return None
-    lower_bound = float(bsm_price(spot, strike, time_years, rate, dividend_yield, MIN_VOLATILITY, option_type))
-    upper_bound = float(bsm_price(spot, strike, time_years, rate, dividend_yield, MAX_VOLATILITY, option_type))
+    lower_bound = float(
+        bsm_price(
+            spot, strike, time_years, rate, dividend_yield, MIN_VOLATILITY, option_type
+        )
+    )
+    upper_bound = float(
+        bsm_price(
+            spot, strike, time_years, rate, dividend_yield, MAX_VOLATILITY, option_type
+        )
+    )
     if observed_price < lower_bound - 1e-6 or observed_price > upper_bound + 1e-6:
         return None
     try:
         return float(
             brentq(
-                lambda sigma: float(bsm_price(spot, strike, time_years, rate, dividend_yield, sigma, option_type)) - observed_price,
+                lambda sigma: float(
+                    bsm_price(
+                        spot,
+                        strike,
+                        time_years,
+                        rate,
+                        dividend_yield,
+                        sigma,
+                        option_type,
+                    )
+                )
+                - observed_price,
                 MIN_VOLATILITY,
                 MAX_VOLATILITY,
                 xtol=1e-8,
@@ -484,16 +576,39 @@ def normalize_chain(
             observed = last
             source = "last fallback"
         else:
-            fallback_iv = yahoo_iv if yahoo_iv > MIN_VOLATILITY else 0.30
-            observed = float(bsm_price(spot, float(row["strike"]), time_years, rate, dividend_yield, fallback_iv, option_type))
+            fallback_iv = min(
+                max(yahoo_iv if yahoo_iv > MIN_VOLATILITY else 0.30, MIN_VOLATILITY),
+                MAX_VOLATILITY,
+            )
+            observed = float(
+                bsm_price(
+                    spot,
+                    float(row["strike"]),
+                    time_years,
+                    rate,
+                    dividend_yield,
+                    fallback_iv,
+                    option_type,
+                )
+            )
             source = "model fallback"
         solved_iv = solve_implied_volatility(
-            observed, spot, float(row["strike"]), time_years, rate, dividend_yield, option_type
+            observed,
+            spot,
+            float(row["strike"]),
+            time_years,
+            rate,
+            dividend_yield,
+            option_type,
         )
-        yahoo_effective_iv = (
-            yahoo_iv
-            if yahoo_iv > MIN_VOLATILITY
-            else (solved_iv if solved_iv is not None else 0.30)
+        yahoo_effective_iv = min(
+            max(
+                yahoo_iv
+                if yahoo_iv > MIN_VOLATILITY
+                else (solved_iv if solved_iv is not None else 0.30),
+                MIN_VOLATILITY,
+            ),
+            MAX_VOLATILITY,
         )
         calculated_effective_iv = (
             solved_iv if solved_iv is not None else yahoo_effective_iv
@@ -517,7 +632,9 @@ def normalize_chain(
             option_type,
         )
         midpoint = (bid + ask) / 2.0 if valid_market else observed
-        spread_ratio = (ask - bid) / midpoint if valid_market and midpoint > 0 else math.inf
+        spread_ratio = (
+            (ask - bid) / midpoint if valid_market and midpoint > 0 else math.inf
+        )
         warnings: list[str] = []
         if not valid_market:
             warnings.append("incomplete market quote")
@@ -558,7 +675,9 @@ def normalize_chain(
                 "ivSource": "Yahoo",
             }
         )
-    return pd.DataFrame.from_records(records).sort_values("strike").reset_index(drop=True)
+    return (
+        pd.DataFrame.from_records(records).sort_values("strike").reset_index(drop=True)
+    )
 
 
 def apply_iv_source(frame: pd.DataFrame, iv_source: str) -> pd.DataFrame:
@@ -568,9 +687,7 @@ def apply_iv_source(frame: pd.DataFrame, iv_source: str) -> pd.DataFrame:
     result["modelIV"] = result[
         "calculatedEffectiveIV" if use_calculated else "yahooEffectiveIV"
     ]
-    result["delta"] = result[
-        "calculatedDelta" if use_calculated else "yahooDelta"
-    ]
+    result["delta"] = result["calculatedDelta" if use_calculated else "yahooDelta"]
     result["ivSource"] = iv_source
 
     warnings: list[str] = []
@@ -582,7 +699,10 @@ def apply_iv_source(frame: pd.DataFrame, iv_source: str) -> pd.DataFrame:
             finite_float(row.get("calculatedIV"), math.nan)
         ):
             parts.append("calculated IV unavailable")
-        if not use_calculated and finite_float(row.get("yahooIV"), 0.0) <= MIN_VOLATILITY:
+        if (
+            not use_calculated
+            and finite_float(row.get("yahooIV"), 0.0) <= MIN_VOLATILITY
+        ):
             parts.append("Yahoo IV unavailable")
         warnings.append(", ".join(parts))
     result["warning"] = warnings
@@ -629,7 +749,9 @@ def load_prepared_option_chain(
     return calls, puts
 
 
-def chain_for_type(chains: dict[date, dict[str, pd.DataFrame]], expiration: date, option_type: str) -> pd.DataFrame:
+def chain_for_type(
+    chains: dict[date, dict[str, pd.DataFrame]], expiration: date, option_type: str
+) -> pd.DataFrame:
     return chains[expiration][option_type]
 
 
@@ -657,7 +779,10 @@ def leg_from_chain(
         last=finite_float(row["lastPrice"]),
         market_mid=finite_float(row["marketMid"]),
         yahoo_iv=finite_float(row["yahooIV"]),
-        model_iv=max(finite_float(row["modelIV"], 0.30), MIN_VOLATILITY),
+        model_iv=min(
+            max(finite_float(row["modelIV"], 0.30), MIN_VOLATILITY),
+            MAX_VOLATILITY,
+        ),
         volume=finite_float(row["volume"]),
         open_interest=finite_float(row["openInterest"]),
         calculated_iv=finite_float(row["calculatedIV"], math.nan),
@@ -669,6 +794,7 @@ def leg_from_chain(
 # ============================================================
 # STRATEGY TEMPLATES AND DEFAULT STRIKES
 # ============================================================
+
 
 def nearest_strike(frame: pd.DataFrame, target: float) -> float:
     """Return the listed strike closest to a requested price."""
@@ -715,20 +841,38 @@ def default_leg_specs(
     if strategy == "Short Put":
         return [("put", -1, front_expiration, atm_put)]
     if strategy == "Bull Call Debit Spread":
-        return [("call", 1, front_expiration, atm_call), ("call", -1, front_expiration, adjacent_strike(calls, atm_call, 1))]
+        return [
+            ("call", 1, front_expiration, atm_call),
+            ("call", -1, front_expiration, adjacent_strike(calls, atm_call, 1)),
+        ]
     if strategy == "Bear Call Credit Spread":
         short_strike = nearest_delta(calls, 0.20)
-        return [("call", -1, front_expiration, short_strike), ("call", 1, front_expiration, adjacent_strike(calls, short_strike, 1))]
+        return [
+            ("call", -1, front_expiration, short_strike),
+            ("call", 1, front_expiration, adjacent_strike(calls, short_strike, 1)),
+        ]
     if strategy == "Bear Put Debit Spread":
-        return [("put", 1, front_expiration, atm_put), ("put", -1, front_expiration, adjacent_strike(puts, atm_put, -1))]
+        return [
+            ("put", 1, front_expiration, atm_put),
+            ("put", -1, front_expiration, adjacent_strike(puts, atm_put, -1)),
+        ]
     if strategy == "Bull Put Credit Spread":
         short_strike = nearest_delta(puts, 0.20)
-        return [("put", -1, front_expiration, short_strike), ("put", 1, front_expiration, adjacent_strike(puts, short_strike, -1))]
+        return [
+            ("put", -1, front_expiration, short_strike),
+            ("put", 1, front_expiration, adjacent_strike(puts, short_strike, -1)),
+        ]
     if strategy == "Short Straddle":
         shared = nearest_atm(calls, spot)
-        return [("put", -1, front_expiration, shared), ("call", -1, front_expiration, shared)]
+        return [
+            ("put", -1, front_expiration, shared),
+            ("call", -1, front_expiration, shared),
+        ]
     if strategy == "Short Strangle":
-        return [("put", -1, front_expiration, nearest_delta(puts, 0.20)), ("call", -1, front_expiration, nearest_delta(calls, 0.20))]
+        return [
+            ("put", -1, front_expiration, nearest_delta(puts, 0.20)),
+            ("call", -1, front_expiration, nearest_delta(calls, 0.20)),
+        ]
     if strategy == "Iron Condor":
         short_put = nearest_delta(puts, 0.20)
         short_call = nearest_delta(calls, 0.20)
@@ -773,6 +917,7 @@ def default_leg_specs(
 # POSITION VALUATION, EXECUTION AND SIMULATION
 # ============================================================
 
+
 def execution_estimate(legs: Sequence[OptionLeg]) -> ExecutionEstimate:
     """Aggregate signed debit (+) / credit (-) prices per share."""
     natural = midpoint = favorable = 0.0
@@ -791,14 +936,14 @@ def execution_estimate(legs: Sequence[OptionLeg]) -> ExecutionEstimate:
     return ExecutionEstimate(natural=natural, midpoint=midpoint, favorable=favorable)
 
 
-def adjusted_volatility(leg: OptionLeg, front_expiration: date, front_points: float, back_points: float) -> float:
+def adjusted_volatility(
+    leg: OptionLeg, front_expiration: date, front_points: float, back_points: float
+) -> float:
     adjustment = front_points if leg.expiration == front_expiration else back_points
     return min(max(leg.model_iv + adjustment / 100.0, MIN_VOLATILITY), MAX_VOLATILITY)
 
 
-def average_starting_iv(
-    legs: Sequence[OptionLeg], expiration: date
-) -> float:
+def average_starting_iv(legs: Sequence[OptionLeg], expiration: date) -> float:
     """Return the average unshocked model IV for legs in one expiration."""
     values = [leg.model_iv for leg in legs if leg.expiration == expiration]
     return float(np.mean(values)) if values else 0.0
@@ -889,9 +1034,7 @@ def position_secondary_greeks(
         density = norm.pdf(d1_value)
         raw_vega = spot * discount_q * density * math.sqrt(time_years)
         vanna_per_point = -discount_q * density * d2_value / volatility / 100.0
-        vomma_per_point_squared = (
-            raw_vega * d1_value * d2_value / volatility / 10_000.0
-        )
+        vomma_per_point_squared = raw_vega * d1_value * d2_value / volatility / 10_000.0
 
         delta_now = bsm_greeks(
             spot,
@@ -932,15 +1075,20 @@ def vega_by_expiration(
     back_vega = 0.0
     has_back_legs = False
     for leg in legs:
-        leg_vega = bsm_greeks(
-            spot,
-            leg.strike,
-            years_between(valuation_date, leg.expiration),
-            rate,
-            dividend_yield,
-            leg.model_iv,
-            leg.option_type,
-        )["vega"] * leg.side * leg.quantity * leg.multiplier
+        leg_vega = (
+            bsm_greeks(
+                spot,
+                leg.strike,
+                years_between(valuation_date, leg.expiration),
+                rate,
+                dividend_yield,
+                leg.model_iv,
+                leg.option_type,
+            )["vega"]
+            * leg.side
+            * leg.quantity
+            * leg.multiplier
+        )
         if leg.expiration == front_expiration:
             front_vega += leg_vega
         else:
@@ -963,21 +1111,27 @@ def capital_at_risk(
     high_price = max(leg.strike for leg in legs) * 3.0
     grid = np.unique(
         np.concatenate(
-            (np.linspace(0.0, high_price, 6001), np.asarray([leg.strike for leg in legs]))
+            (
+                np.linspace(0.0, high_price, 6001),
+                np.asarray([leg.strike for leg in legs]),
+            )
         )
     )
-    pnl = np.asarray(
-        position_value(
-            legs,
-            grid,
-            front_expiration,
-            rate,
-            dividend_yield,
-            front_expiration,
-            0.0,
-            0.0,
+    pnl = (
+        np.asarray(
+            position_value(
+                legs,
+                grid,
+                front_expiration,
+                rate,
+                dividend_yield,
+                front_expiration,
+                0.0,
+                0.0,
+            )
         )
-    ) - entry_per_share * CONTRACT_MULTIPLIER
+        - entry_per_share * CONTRACT_MULTIPLIER
+    )
     return max(-float(np.min(pnl)), 0.0)
 
 
@@ -1002,9 +1156,7 @@ def calculate_advanced_metrics(
     entry_greeks: dict[str, float],
 ) -> AdvancedMetrics:
     """Calculate transparent entry ratios and user-controlled P&L scenarios."""
-    secondary = position_secondary_greeks(
-        legs, spot, entry_date, rate, dividend_yield
-    )
+    secondary = position_secondary_greeks(legs, spot, entry_date, rate, dividend_yield)
     front_vega, back_vega = vega_by_expiration(
         legs, spot, entry_date, rate, dividend_yield, front_expiration
     )
@@ -1016,9 +1168,7 @@ def calculate_advanced_metrics(
     gamma_move_risk = 0.5 * abs(entry_greeks["gamma"]) * (spot * 0.01) ** 2
     theta_to_gamma = safe_ratio(entry_greeks["theta"], gamma_move_risk)
     back_front_ratio = (
-        safe_ratio(abs(back_vega), abs(front_vega))
-        if back_vega is not None
-        else None
+        safe_ratio(abs(back_vega), abs(front_vega)) if back_vega is not None else None
     )
 
     entry_dollars = entry_per_share * CONTRACT_MULTIPLIER
@@ -1029,44 +1179,50 @@ def calculate_advanced_metrics(
         front_points: float,
         back_points: float,
     ) -> float:
-        return float(
-            position_value(
-                legs,
-                center_price,
-                valuation_date,
-                rate,
-                dividend_yield,
-                front_expiration,
-                front_points,
-                back_points,
+        return (
+            float(
+                position_value(
+                    legs,
+                    center_price,
+                    valuation_date,
+                    rate,
+                    dividend_yield,
+                    front_expiration,
+                    front_points,
+                    back_points,
+                )
             )
-        ) - entry_dollars
+            - entry_dollars
+        )
 
     center_pnl = pnl_at_center(selected_date, front_iv_points, back_iv_points)
 
     front_ivs = [leg.model_iv for leg in legs if leg.expiration == front_expiration]
     back_ivs = [leg.model_iv for leg in legs if leg.expiration != front_expiration]
     front_iv = float(np.mean(front_ivs)) if front_ivs else 0.0
-    expected_move = spot * front_iv * math.sqrt(
-        years_between(entry_date, front_expiration)
+    expected_move = (
+        spot * front_iv * math.sqrt(years_between(entry_date, front_expiration))
     )
     move_grid = np.linspace(
         max(0.01, spot - expected_move),
         spot + expected_move,
         301,
     )
-    move_pnl = np.asarray(
-        position_value(
-            legs,
-            move_grid,
-            front_expiration,
-            rate,
-            dividend_yield,
-            front_expiration,
-            front_iv_points,
-            back_iv_points,
+    move_pnl = (
+        np.asarray(
+            position_value(
+                legs,
+                move_grid,
+                front_expiration,
+                rate,
+                dividend_yield,
+                front_expiration,
+                front_iv_points,
+                back_iv_points,
+            )
         )
-    ) - entry_dollars
+        - entry_dollars
+    )
     pnl_through_move = float(np.min(move_pnl))
 
     crush_capture: float | None = None
@@ -1074,12 +1230,8 @@ def calculate_advanced_metrics(
     raw_iv_gap: float | None = None
     if back_vega is not None and back_ivs:
         base_center = pnl_at_center(entry_date, 0.0, 0.0)
-        front_crush_center = pnl_at_center(
-            entry_date, -STANDARD_CRUSH_POINTS, 0.0
-        )
-        back_crush_center = pnl_at_center(
-            entry_date, 0.0, -STANDARD_CRUSH_POINTS
-        )
+        front_crush_center = pnl_at_center(entry_date, -STANDARD_CRUSH_POINTS, 0.0)
+        back_crush_center = pnl_at_center(entry_date, 0.0, -STANDARD_CRUSH_POINTS)
         front_crush_benefit = front_crush_center - base_center
         back_crush_damage = base_center - back_crush_center
         crush_capture = safe_ratio(front_crush_benefit, back_crush_damage)
@@ -1090,9 +1242,7 @@ def calculate_advanced_metrics(
         if baseline_front_expiry <= 0.0 or maximum_drop <= 0.0:
             back_iv_breakeven = "0.0 pt"
         else:
-            pnl_after_maximum_drop = pnl_at_center(
-                front_expiration, 0.0, -maximum_drop
-            )
+            pnl_after_maximum_drop = pnl_at_center(front_expiration, 0.0, -maximum_drop)
             if pnl_after_maximum_drop > 0.0:
                 back_iv_breakeven = f">{maximum_drop:.1f} pt"
             else:
@@ -1130,7 +1280,9 @@ def breakevens(prices: np.ndarray, pnl: np.ndarray) -> list[float]:
             roots.append(float(prices[index]))
         elif left * right < 0:
             weight = abs(left) / (abs(left) + abs(right))
-            roots.append(float(prices[index] + weight * (prices[index + 1] - prices[index])))
+            roots.append(
+                float(prices[index] + weight * (prices[index + 1] - prices[index]))
+            )
     return roots
 
 
@@ -1145,18 +1297,21 @@ def expiration_breakevens(
     """Find expiry breakevens on a broad grid independent of chart range."""
     highest_reference = max(spot, *(leg.strike for leg in legs))
     scan_prices = np.linspace(0.01, highest_reference * 3.0, 8001)
-    expiry_pnl = np.asarray(
-        position_value(
-            legs,
-            scan_prices,
-            front_expiration,
-            rate,
-            dividend_yield,
-            front_expiration,
-            0.0,
-            0.0,
+    expiry_pnl = (
+        np.asarray(
+            position_value(
+                legs,
+                scan_prices,
+                front_expiration,
+                rate,
+                dividend_yield,
+                front_expiration,
+                0.0,
+                0.0,
+            )
         )
-    ) - entry_per_share * CONTRACT_MULTIPLIER
+        - entry_per_share * CONTRACT_MULTIPLIER
+    )
     return breakevens(scan_prices, expiry_pnl)
 
 
@@ -1192,16 +1347,52 @@ def risk_summary(
         strikes = [leg.strike for leg in legs]
         high = max(strikes) * 2.5
         grid = np.linspace(0.01, high, 2401)
-        pnl = np.asarray(position_value(legs, grid, front_expiration, rate, dividend_yield, front_expiration, 0.0, 0.0)) - entry_dollars
-        return money(float(np.max(pnl))), money(abs(float(np.min(pnl)))), "Modeled at front expiration"
+        pnl = (
+            np.asarray(
+                position_value(
+                    legs,
+                    grid,
+                    front_expiration,
+                    rate,
+                    dividend_yield,
+                    front_expiration,
+                    0.0,
+                    0.0,
+                )
+            )
+            - entry_dollars
+        )
+        return (
+            money(float(np.max(pnl))),
+            money(abs(float(np.min(pnl)))),
+            "Modeled at front expiration",
+        )
     if strategy in {"Long Call"}:
         return "Unlimited", money(max(entry_dollars, 0.0)), "Theoretical"
     if strategy in {"Short Call", "Short Straddle", "Short Strangle"}:
         return money(max(-entry_dollars, 0.0)), "Unlimited", "Theoretical"
 
     highest_strike = max(leg.strike for leg in legs)
-    grid = np.unique(np.concatenate((np.linspace(0.0, highest_strike * 3.0, 6001), np.asarray([leg.strike for leg in legs]))))
-    expiry_value = np.asarray(position_value(legs, grid, front_expiration, rate, dividend_yield, front_expiration, 0.0, 0.0))
+    grid = np.unique(
+        np.concatenate(
+            (
+                np.linspace(0.0, highest_strike * 3.0, 6001),
+                np.asarray([leg.strike for leg in legs]),
+            )
+        )
+    )
+    expiry_value = np.asarray(
+        position_value(
+            legs,
+            grid,
+            front_expiration,
+            rate,
+            dividend_yield,
+            front_expiration,
+            0.0,
+            0.0,
+        )
+    )
     pnl = expiry_value - entry_dollars
     return money(float(np.max(pnl))), money(abs(float(np.min(pnl)))), "Theoretical"
 
@@ -1209,6 +1400,7 @@ def risk_summary(
 # ============================================================
 # PLOTLY CHART
 # ============================================================
+
 
 def loss_fill_polygons(
     prices: np.ndarray,
@@ -1247,7 +1439,9 @@ def loss_fill_polygons(
             left_thickness = band_thickness[start - 1]
             right_thickness = band_thickness[start]
             fraction = -left_thickness / (right_thickness - left_thickness)
-            crossing_x = prices[start - 1] + fraction * (prices[start] - prices[start - 1])
+            crossing_x = prices[start - 1] + fraction * (
+                prices[start] - prices[start - 1]
+            )
             lower_crossing = theoretical_pnl[start - 1] + fraction * (
                 theoretical_pnl[start] - theoretical_pnl[start - 1]
             )
@@ -1329,12 +1523,8 @@ def spot_percentage_ticks(
     )
     percent_step = nice_fraction * magnitude
 
-    first_multiple = math.ceil(
-        (lower_percent - percent_step * 1e-9) / percent_step
-    )
-    last_multiple = math.floor(
-        (upper_percent + percent_step * 1e-9) / percent_step
-    )
+    first_multiple = math.ceil((lower_percent - percent_step * 1e-9) / percent_step)
+    last_multiple = math.floor((upper_percent + percent_step * 1e-9) / percent_step)
     multiples = np.arange(first_multiple, last_multiple + 1, dtype=float)
     percent_values = multiples * percent_step
     price_values = spot * (1.0 + percent_values / 100.0)
@@ -1445,9 +1635,7 @@ def build_pnl_figure(
     price_tick_values = shared_price_ticks(x_min, x_max)
     # Anchor the percentage scale at spot so that its intervals radiate from a
     # clearly defined 0%. Each tick position remains an exact price mapping.
-    percentage_tick_prices, x_percent_labels = spot_percentage_ticks(
-        x_min, x_max, spot
-    )
+    percentage_tick_prices, x_percent_labels = spot_percentage_ticks(x_min, x_max, spot)
 
     plotted_pnl = np.concatenate((selected_pnl, expiry_pnl, np.asarray([0.0])))
     y_min, y_max = float(np.min(plotted_pnl)), float(np.max(plotted_pnl))
@@ -1481,12 +1669,9 @@ def build_pnl_figure(
                     "line": {"color": "#ffffff", "width": 1},
                 },
                 customdata=[
-                    f"{leg.label} · {leg.expiration:%b %d, %Y}"
-                    for leg in side_legs
+                    f"{leg.label} · {leg.expiration:%b %d, %Y}" for leg in side_legs
                 ],
-                hovertemplate=(
-                    "%{customdata}<br>Strike $%{x:,.2f}<extra></extra>"
-                ),
+                hovertemplate=("%{customdata}<br>Strike $%{x:,.2f}<extra></extra>"),
             )
         )
 
@@ -1595,28 +1780,37 @@ def build_pnl_figure(
 # STRIKE SELECTOR AND DISPLAY HELPERS
 # ============================================================
 
+
 def synchronize_anchored_strike(
     source_widget_key: str,
     source_canonical_key: str,
     source_query_key: str,
-    target_widget_key: str,
-    target_canonical_key: str,
-    target_query_key: str,
+    target_canonical_key: str | None,
+    target_revision_key: str | None,
+    target_query_key: str | None,
     target_strikes: tuple[float, ...],
     anchor_state_key: str,
 ) -> None:
-    """Synchronize a paired strike before Streamlit begins its rerun."""
+    """Commit a strike and optionally synchronize its pair before rerun."""
     source_strike = float(st.session_state[source_widget_key])
     st.session_state[source_canonical_key] = source_strike
     persist_query_value(source_query_key, f"{source_strike:g}")
-    if not st.session_state.get(anchor_state_key, False):
+    if (
+        target_canonical_key is None
+        or target_revision_key is None
+        or target_query_key is None
+        or not target_strikes
+        or not st.session_state.get(anchor_state_key, False)
+    ):
         return
 
-    target_strike = min(
-        target_strikes, key=lambda strike: abs(strike - source_strike)
-    )
+    target_strike = min(target_strikes, key=lambda strike: abs(strike - source_strike))
+    prior_target = finite_float(st.session_state.get(target_canonical_key), math.nan)
     st.session_state[target_canonical_key] = target_strike
-    st.session_state[target_widget_key] = target_strike
+    if not math.isclose(prior_target, target_strike, rel_tol=0.0, abs_tol=1e-9):
+        st.session_state[target_revision_key] = (
+            int(st.session_state.get(target_revision_key, 0)) + 1
+        )
     persist_query_value(target_query_key, f"{target_strike:g}")
 
 
@@ -1626,6 +1820,7 @@ def render_strike_selector(
     frame: pd.DataFrame,
     context_key: str,
     view_mode: str,
+    iv_source: str,
     initial_strike: float,
     anchor_target_index: int | None = None,
     anchor_target_strikes: tuple[float, ...] = (),
@@ -1640,7 +1835,7 @@ def render_strike_selector(
             f"  ·  IV {signed_iv(finite_float(option_row['modelIV']))}"
         )
     canonical_key = f"strike_value_{context_key}_{leg_index}"
-    mode_key = f"strike_mode_{context_key}_{leg_index}"
+    revision_key = f"strike_revision_{context_key}_{leg_index}"
     if canonical_key not in st.session_state:
         st.session_state[canonical_key] = min(
             all_strikes, key=lambda item: abs(item - initial_strike)
@@ -1652,49 +1847,53 @@ def render_strike_selector(
         )
 
     widget_kind = "list" if view_mode == "List view" else "slider"
-    widget_key = f"strike_{widget_kind}_{context_key}_{leg_index}"
-    rebuild_widget = (
-        widget_key not in st.session_state
-        or st.session_state.get(mode_key) != view_mode
-        or (
-            widget_key in st.session_state
-            and float(st.session_state[widget_key]) not in all_strikes
-        )
+    revision = int(st.session_state.get(revision_key, 0))
+    source_slug = iv_source.lower()
+    variant_key = f"strike_variant_{context_key}_{leg_index}"
+    current_variant = f"{widget_kind}_{source_slug}_{revision}"
+    widget_key = (
+        f"strike_{widget_kind}_{context_key}_{leg_index}_{source_slug}_{revision}"
     )
-    if rebuild_widget and widget_key in st.session_state:
-        # Let the widget receive an explicit default below. Preloading its key
-        # and omitting index/value can race with Streamlit's widget restoration
-        # and silently select the first (lowest) strike.
+    variant_changed = st.session_state.get(variant_key) != current_variant
+    if widget_key in st.session_state and (
+        variant_changed or float(st.session_state[widget_key]) not in all_strikes
+    ):
         del st.session_state[widget_key]
-    st.session_state[mode_key] = view_mode
+    st.session_state[variant_key] = current_variant
+    if widget_key in st.session_state:
+        st.session_state[canonical_key] = float(st.session_state[widget_key])
     canonical_strike = float(st.session_state[canonical_key])
-    change_callback: dict[str, object] = {}
-    if anchor_target_index is not None and anchor_target_strikes:
-        target_widget_key = (
-            f"strike_{widget_kind}_{context_key}_{anchor_target_index}"
-        )
-        change_callback = {
-            "on_change": synchronize_anchored_strike,
-            "args": (
-                widget_key,
-                canonical_key,
-                f"strike_{leg_index}",
-                target_widget_key,
-                f"strike_value_{context_key}_{anchor_target_index}",
-                f"strike_{anchor_target_index}",
-                anchor_target_strikes,
-                anchor_state_key,
-            ),
-        }
+    target_canonical_key = (
+        f"strike_value_{context_key}_{anchor_target_index}"
+        if anchor_target_index is not None
+        else None
+    )
+    target_revision_key = (
+        f"strike_revision_{context_key}_{anchor_target_index}"
+        if anchor_target_index is not None
+        else None
+    )
+    target_query_key = (
+        f"strike_{anchor_target_index}" if anchor_target_index is not None else None
+    )
+    change_callback = {
+        "on_change": synchronize_anchored_strike,
+        "args": (
+            widget_key,
+            canonical_key,
+            f"strike_{leg_index}",
+            target_canonical_key,
+            target_revision_key,
+            target_query_key,
+            anchor_target_strikes,
+            anchor_state_key,
+        ),
+    }
 
     # Render the heading in its final position before creating the widget.
     # A prior st.empty() placeholder was filled only after the selector was
     # created, causing the control row to shift visibly on every app rerun.
-    displayed_strike = (
-        canonical_strike
-        if rebuild_widget
-        else float(st.session_state.get(widget_key, canonical_strike))
-    )
+    displayed_strike = float(st.session_state.get(widget_key, canonical_strike))
     displayed_row = row_for_strike(frame, displayed_strike)
     displayed_warning_value = displayed_row.get("warning", "")
     displayed_warning = (
@@ -1703,36 +1902,26 @@ def render_strike_selector(
         else ""
     )
     displayed_icon = " ⚠" if displayed_warning else ""
-    st.markdown(
-        f"**{leg.label} · {leg.expiration:%b %d, %Y}{displayed_icon}**"
-    )
+    st.markdown(f"**{leg.label} · {leg.expiration:%b %d, %Y}{displayed_icon}**")
 
     if view_mode == "List view":
-        list_defaults = (
-            {"index": all_strikes.index(canonical_strike)}
-            if rebuild_widget
-            else {}
-        )
         selected = st.selectbox(
             "Strike",
             options=all_strikes,
+            index=all_strikes.index(canonical_strike),
             format_func=lambda item: option_labels[item],
             key=widget_key,
             label_visibility="collapsed",
-            **list_defaults,
             **change_callback,
         )
     else:
-        slider_defaults = (
-            {"value": canonical_strike} if rebuild_widget else {}
-        )
         selected = st.select_slider(
             "Strike",
             options=all_strikes,
+            value=canonical_strike,
             format_func=lambda item: option_labels[item],
             key=widget_key,
             label_visibility="collapsed",
-            **slider_defaults,
             **change_callback,
         )
     selected = float(selected)
@@ -1742,9 +1931,7 @@ def render_strike_selector(
     warning = str(warning_value).strip() if pd.notna(warning_value) else ""
     bid_text = price_text(finite_float(row["bid"])).replace("$", r"\$")
     ask_text = price_text(finite_float(row["ask"])).replace("$", r"\$")
-    detail = (
-        f"Bid / ask  {bid_text} / {ask_text}"
-    )
+    detail = f"Bid / ask  {bid_text} / {ask_text}"
     if warning:
         detail += f"  ·  ⚠ {warning}"
     st.caption(detail)
@@ -1802,10 +1989,19 @@ def advanced_metric_groups(
         ("Front Vega / pt", f"${advanced.front_vega:+,.2f}"),
         ("Back Vega / pt", optional_metric(advanced.back_vega, "${:+,.2f}")),
         ("Vega / risk", optional_metric(advanced.vega_to_risk_percent, "{:+.3f}%")),
-        ("Theta / risk", optional_metric(advanced.theta_to_risk_percent, "{:+.3f}%/day")),
-        ("Theta / 1% Γ risk", optional_metric(advanced.theta_to_gamma_risk, "{:+.2f}×")),
+        (
+            "Theta / risk",
+            optional_metric(advanced.theta_to_risk_percent, "{:+.3f}%/day"),
+        ),
+        (
+            "Theta / 1% Γ risk",
+            optional_metric(advanced.theta_to_gamma_risk, "{:+.2f}×"),
+        ),
         ("Back / front Vega", optional_metric(advanced.back_to_front_vega, "{:.2f}×")),
-        (f"{STANDARD_CRUSH_POINTS:g}-pt crush capture", optional_metric(advanced.crush_capture_ratio, "{:.2f}×")),
+        (
+            f"{STANDARD_CRUSH_POINTS:g}-pt crush capture",
+            optional_metric(advanced.crush_capture_ratio, "{:.2f}×"),
+        ),
         ("Back-IV crush BE", advanced.back_iv_crush_breakeven),
     ]
     scenarios = [
@@ -1883,9 +2079,7 @@ def render_legacy_metric_grid(
     """Render the original metric-card layout as the instant fallback view."""
     debit_credit = "Debit" if entry_per_share >= 0 else "Credit"
     metric_columns = st.columns(3)
-    metric_columns[0].metric(
-        f"Net {debit_credit}", execution_range_text(execution)
-    )
+    metric_columns[0].metric(f"Net {debit_credit}", execution_range_text(execution))
     metric_columns[1].metric("Max profit", max_profit)
     metric_columns[2].metric("Max loss", max_loss)
 
@@ -1900,6 +2094,7 @@ def render_legacy_metric_grid(
 # ============================================================
 # APPLICATION UI
 # ============================================================
+
 
 def app_styles() -> None:
     st.markdown(
@@ -1949,11 +2144,17 @@ def main() -> None:
     with st.sidebar:
         st.header("Position setup")
         with st.form("symbol_form", border=False):
-            requested_symbol = st.text_input(
-                "Ticker",
-                value=st.session_state.get("loaded_symbol", persisted_symbol),
-            ).strip().upper()
-            load_clicked = st.form_submit_button("Load ticker", type="primary", use_container_width=True)
+            requested_symbol = (
+                st.text_input(
+                    "Ticker",
+                    value=st.session_state.get("loaded_symbol", persisted_symbol),
+                )
+                .strip()
+                .upper()
+            )
+            load_clicked = st.form_submit_button(
+                "Load ticker", type="primary", use_container_width=True
+            )
         if load_clicked or "loaded_symbol" not in st.session_state:
             st.session_state["loaded_symbol"] = requested_symbol or persisted_symbol
         symbol = str(st.session_state["loaded_symbol"])
@@ -2015,19 +2216,25 @@ def main() -> None:
                 market = load_market_context(symbol)
             st.session_state[market_ready_key] = True
     except Exception as exc:
-        st.error(f"Could not load options for {symbol}. Check the ticker or try again shortly.")
+        st.error(
+            f"Could not load options for {symbol}. Check the ticker or try again shortly."
+        )
         with st.expander("Technical detail"):
             st.code(str(exc))
         return
 
     today = date.today()
-    valid_expirations = [expiration for expiration in market.expirations if expiration >= today]
+    valid_expirations = [
+        expiration for expiration in market.expirations if expiration >= today
+    ]
     if not valid_expirations:
         st.warning(f"No current expirations were returned for {symbol}.")
         return
 
     rate = rate_percent / 100.0
-    dividend_yield = dividend_percent / 100.0 if dividend_override else market.dividend_yield
+    dividend_yield = (
+        dividend_percent / 100.0 if dividend_override else market.dividend_yield
+    )
     is_time_spread = strategy in TIME_SPREAD_STRATEGIES
 
     with st.sidebar:
@@ -2053,13 +2260,19 @@ def main() -> None:
             "Expiration" if not is_time_spread else "Front expiration",
             valid_expirations,
             index=front_index,
-            format_func=lambda item: f"{item:%b %d, %Y} · {(item - today).days} DTE",
+            format_func=lambda item: expiration_label(item, today),
         )
         back_expiration: date | None = None
         if is_time_spread:
-            back_choices = [expiration for expiration in valid_expirations if expiration > front_expiration]
+            back_choices = [
+                expiration
+                for expiration in valid_expirations
+                if expiration > front_expiration
+            ]
             if not back_choices:
-                st.warning("Choose an earlier front expiration to create a time spread.")
+                st.warning(
+                    "Choose an earlier front expiration to create a time spread."
+                )
                 return
             saved_back_iso = query_text("back_expiration")
             saved_back = next(
@@ -2083,13 +2296,15 @@ def main() -> None:
                 "Back expiration",
                 back_choices,
                 index=back_index,
-                format_func=lambda item: f"{item:%b %d, %Y} · {(item - today).days} DTE",
+                format_func=lambda item: expiration_label(item, today),
             )
     persist_query_value("front_expiration", front_expiration.isoformat())
     if back_expiration is not None:
         persist_query_value("back_expiration", back_expiration.isoformat())
 
-    required_expirations = [front_expiration] + ([back_expiration] if back_expiration else [])
+    required_expirations = [front_expiration] + (
+        [back_expiration] if back_expiration else []
+    )
 
     def prepared_chains() -> dict[date, dict[str, pd.DataFrame]]:
         result: dict[date, dict[str, pd.DataFrame]] = {}
@@ -2105,9 +2320,7 @@ def main() -> None:
             calls = apply_iv_source(calls, iv_source)
             puts = apply_iv_source(puts, iv_source)
             if calls.empty or puts.empty:
-                raise ValueError(
-                    f"The {expiration:%Y-%m-%d} chain was incomplete."
-                )
+                raise ValueError(f"The {expiration:%Y-%m-%d} chain was incomplete.")
             result[expiration] = {"call": calls, "put": puts}
         return result
 
@@ -2123,7 +2336,9 @@ def main() -> None:
                 chains = prepared_chains()
             st.session_state[chain_ready_key] = True
     except Exception as exc:
-        st.error("The selected option chain could not be loaded. Yahoo may be temporarily unavailable.")
+        st.error(
+            "The selected option chain could not be loaded. Yahoo may be temporarily unavailable."
+        )
         with st.expander("Technical detail"):
             st.code(str(exc))
         return
@@ -2132,8 +2347,13 @@ def main() -> None:
     # double-diagonal display order changed in this release.
     context_key = f"v3_{symbol}_{strategy}_{front_expiration}_{back_expiration}"
     try:
-        specifications = default_leg_specs(strategy, chains, front_expiration, back_expiration, market.spot)
-        default_legs = [leg_from_chain(chains, option_type, side, expiration, strike) for option_type, side, expiration, strike in specifications]
+        specifications = default_leg_specs(
+            strategy, chains, front_expiration, back_expiration, market.spot
+        )
+        default_legs = [
+            leg_from_chain(chains, option_type, side, expiration, strike)
+            for option_type, side, expiration, strike in specifications
+        ]
     except Exception as exc:
         st.warning("There are not enough usable strikes to initialize this strategy.")
         with st.expander("Technical detail"):
@@ -2197,6 +2417,52 @@ def main() -> None:
     persist_query_value("strike_view", strike_view)
     persist_query_value("anchor_pairs", str(anchor_pairs).lower())
     same_persisted_context = query_text("position_context") == context_key
+    anchor_status_key = f"anchor_active_{context_key}"
+    anchor_was_active = bool(st.session_state.get(anchor_status_key, False))
+    if anchor_pairs and not anchor_was_active:
+        # The checkbox is rendered before the strike controls, so paired
+        # canonical values can be aligned safely without mutating live widgets.
+        for source_index, source_leg in enumerate(default_legs):
+            if source_leg.side >= 0:
+                continue
+            target_index = next(
+                (
+                    candidate_index
+                    for candidate_index, candidate in enumerate(default_legs)
+                    if candidate_index != source_index
+                    and candidate.option_type == source_leg.option_type
+                    and candidate.side > 0
+                ),
+                None,
+            )
+            if target_index is None:
+                continue
+            source_value = float(
+                st.session_state.get(
+                    f"strike_value_{context_key}_{source_index}",
+                    query_float(f"strike_{source_index}", source_leg.strike)
+                    if same_persisted_context
+                    else source_leg.strike,
+                )
+            )
+            target_leg = default_legs[target_index]
+            target_frame = chain_for_type(
+                chains, target_leg.expiration, target_leg.option_type
+            )
+            target_value = nearest_strike(target_frame, source_value)
+            target_canonical_key = f"strike_value_{context_key}_{target_index}"
+            prior_target = finite_float(
+                st.session_state.get(target_canonical_key), math.nan
+            )
+            st.session_state[target_canonical_key] = target_value
+            revision_key = f"strike_revision_{context_key}_{target_index}"
+            if not math.isclose(prior_target, target_value, rel_tol=0.0, abs_tol=1e-9):
+                st.session_state[revision_key] = (
+                    int(st.session_state.get(revision_key, 0)) + 1
+                )
+            persist_query_value(f"strike_{target_index}", f"{target_value:g}")
+    st.session_state[anchor_status_key] = anchor_pairs
+
     selected_legs: list[OptionLeg] = []
     for index, leg in enumerate(default_legs):
         with columns[index % len(columns)]:
@@ -2231,12 +2497,17 @@ def main() -> None:
                 frame,
                 context_key,
                 strike_view,
+                iv_source,
                 initial_strike,
                 target_index,
                 target_strikes,
                 anchor_widget_key,
             )
-            selected_legs.append(leg_from_chain(chains, leg.option_type, leg.side, leg.expiration, selected_strike))
+            selected_legs.append(
+                leg_from_chain(
+                    chains, leg.option_type, leg.side, leg.expiration, selected_strike
+                )
+            )
 
     persist_query_value("position_context", context_key)
     for index, leg in enumerate(selected_legs):
@@ -2264,9 +2535,7 @@ def main() -> None:
     strike_key = "_".join(f"{leg.strike:g}" for leg in selected_legs)
     front_starting_iv = average_starting_iv(selected_legs, front_expiration)
     front_iv_label = (
-        "Front Implied Volatility (IV)"
-        if is_time_spread
-        else "Implied Volatility (IV)"
+        "Front Implied Volatility (IV)" if is_time_spread else "Implied Volatility (IV)"
     )
     iv_source_key = iv_source.lower()
     front_iv_query_key = f"front_iv_{iv_source_key}"
@@ -2308,9 +2577,7 @@ def main() -> None:
         front_iv_points = front_iv_percent - front_starting_iv * 100.0
     if control_right is not None:
         with control_right:
-            back_starting_iv = average_starting_iv(
-                selected_legs, back_expiration
-            )
+            back_starting_iv = average_starting_iv(selected_legs, back_expiration)
             saved_back_iv = (
                 query_float(back_iv_query_key, back_starting_iv * 100.0)
                 if same_persisted_context
@@ -2359,17 +2626,33 @@ def main() -> None:
     price_grid = np.linspace(lower_price, upper_price, 401)
     entry_dollars = entry_per_share * CONTRACT_MULTIPLIER
     selected_value = np.asarray(
-        position_value(selected_legs, price_grid, selected_date, rate, dividend_yield, front_expiration, front_iv_points, back_iv_points)
+        position_value(
+            selected_legs,
+            price_grid,
+            selected_date,
+            rate,
+            dividend_yield,
+            front_expiration,
+            front_iv_points,
+            back_iv_points,
+        )
     )
     expiry_value = np.asarray(
-        position_value(selected_legs, price_grid, front_expiration, rate, dividend_yield, front_expiration, front_iv_points, back_iv_points)
+        position_value(
+            selected_legs,
+            price_grid,
+            front_expiration,
+            rate,
+            dividend_yield,
+            front_expiration,
+            front_iv_points,
+            back_iv_points,
+        )
     )
     selected_pnl = selected_value - entry_dollars
     expiry_pnl = expiry_value - entry_dollars
     break_even_points = [
-        point
-        for point in all_break_even_points
-        if lower_price <= point <= upper_price
+        point for point in all_break_even_points if lower_price <= point <= upper_price
     ]
     figure = build_pnl_figure(
         price_grid,
@@ -2460,7 +2743,9 @@ def main() -> None:
                         "Warning": ", ".join(warnings) if warnings else "—",
                     }
                 )
-            st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
+            st.dataframe(
+                pd.DataFrame(diagnostics), hide_index=True, use_container_width=True
+            )
             st.caption(
                 "Yahoo IV is the default pricing source. Calculated IV is "
                 "locally solved from the midpoint and falls back when a valid "
@@ -2469,6 +2754,7 @@ def main() -> None:
 
     with main_view:
         st.caption(f"Quotes received {market.retrieved_at:%b %d, %I:%M %p %Z}.")
+
 
 if __name__ == "__main__":
     main()
