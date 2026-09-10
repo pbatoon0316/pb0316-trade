@@ -296,6 +296,12 @@ def reset_iv_defaults(context_key: str) -> None:
         if key.startswith(("front_iv", "back_iv")):
             del st.query_params[key]
 
+    # Streamlit's browser can retain a keyed number input even after its
+    # session-state entry is removed. Advancing the revision gives both IV
+    # fields a fresh widget identity so their displayed values also reset.
+    revision_key = f"iv_revision_{context_key}"
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
 
 # ============================================================
 # YAHOO MARKET DATA
@@ -2539,6 +2545,7 @@ def main() -> None:
         "Front Implied Volatility (IV)" if is_time_spread else "Implied Volatility (IV)"
     )
     iv_source_key = iv_source.lower()
+    iv_revision = int(st.session_state.get(f"iv_revision_{context_key}", 0))
     front_iv_query_key = f"front_iv_{iv_source_key}"
     back_iv_query_key = f"back_iv_{iv_source_key}"
 
@@ -2575,7 +2582,7 @@ def main() -> None:
             step=0.1,
             format="%.1f",
             help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-            key=f"front_iv_value_{context_key}_{iv_source_key}",
+            key=f"front_iv_value_{context_key}_{iv_source_key}_{iv_revision}",
         )
         front_iv_points = front_iv_percent - front_starting_iv * 100.0
     if control_right is not None:
@@ -2594,7 +2601,7 @@ def main() -> None:
                 step=0.1,
                 format="%.1f",
                 help="Enter IV as a percentage, such as 14.6 for 14.6%.",
-                key=f"back_iv_value_{context_key}_{iv_source_key}",
+                key=f"back_iv_value_{context_key}_{iv_source_key}_{iv_revision}",
             )
             back_iv_points = back_iv_percent - back_starting_iv * 100.0
     else:
