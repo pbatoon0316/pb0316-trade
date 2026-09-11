@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import math
 from pathlib import Path
+import re
 import tempfile
 from typing import Sequence
 
@@ -48,6 +49,8 @@ MAX_VOLATILITY = 5.0
 DEFAULT_RATE = 0.043
 DEFAULT_FRONT_DTE = 21
 DEFAULT_BACK_DTE = 45
+DEFAULT_SHORT_DELTA = 0.30
+DEFAULT_DOUBLE_CALENDAR_DELTA = 0.40
 STANDARD_CRUSH_POINTS = 5.0
 WIDE_SPREAD_THRESHOLD = 0.25
 LOW_OPEN_INTEREST = 20
@@ -72,6 +75,22 @@ TIME_SPREAD_STRATEGIES = [
     "Double Calendar / Diagonal",
 ]
 ALL_STRATEGIES = SINGLE_EXPIRY_STRATEGIES + TIME_SPREAD_STRATEGIES
+OPTIONSTRAT_STRATEGY_SLUGS = {
+    "Long Call": "long-call",
+    "Short Call": "short-call",
+    "Long Put": "long-put",
+    "Short Put": "short-put",
+    "Bull Call Debit Spread": "bull-call-spread",
+    "Bear Call Credit Spread": "bear-call-spread",
+    "Bear Put Debit Spread": "bear-put-spread",
+    "Bull Put Credit Spread": "bull-put-spread",
+    "Short Straddle": "short-straddle",
+    "Short Strangle": "short-strangle",
+    "Iron Condor": "iron-condor",
+    "Call Calendar / Diagonal": "calendar-call-spread",
+    "Put Calendar / Diagonal": "calendar-put-spread",
+    "Double Calendar / Diagonal": "double-calendar",
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +111,7 @@ class OptionLeg:
     calculated_iv: float = math.nan
     iv_source: str = "Yahoo"
     quote_source: str = "midpoint"
+    contract_symbol: str = ""
     multiplier: int = CONTRACT_MULTIPLIER
 
     @property
@@ -210,6 +230,30 @@ def expiration_label(expiration: date, valuation_date: date) -> str:
         f"{expiration:%b %d, %Y} ({expiration_type(expiration)}) · "
         f"{(expiration - valuation_date).days} DTE"
     )
+
+
+def optionstrat_url(symbol: str, strategy: str, legs: Sequence[OptionLeg]) -> str:
+    """Build an OptionStrat URL containing the position's selected option legs."""
+    slug = OPTIONSTRAT_STRATEGY_SLUGS[strategy]
+    underlying = symbol.upper().lstrip("^")
+    fallback_root = underlying.replace("-", "").replace(".", "")
+    tokens: list[str] = []
+
+    for leg in legs:
+        occ_match = re.fullmatch(r"(.+?)(\d{6})([CP])(\d{8})", leg.contract_symbol)
+        if occ_match:
+            root, expiry_code, call_put, strike_code = occ_match.groups()
+            contract_strike = int(strike_code) / 1000.0
+            option_symbol = f".{root}{expiry_code}{call_put}{contract_strike:g}"
+        else:
+            call_put = "C" if leg.option_type == "call" else "P"
+            option_symbol = (
+                f".{fallback_root}{leg.expiration:%y%m%d}{call_put}{leg.strike:g}"
+            )
+        signed_symbol = f"-{option_symbol}" if leg.side < 0 else option_symbol
+        tokens.extend([signed_symbol] * leg.quantity)
+
+    return f"https://optionstrat.com/build/{slug}/{underlying}/" + ",".join(tokens)
 
 
 def money(value: float) -> str:
@@ -798,6 +842,7 @@ def leg_from_chain(
         calculated_iv=finite_float(row["calculatedIV"], math.nan),
         iv_source=str(row["ivSource"]),
         quote_source=str(row["quoteSource"]),
+        contract_symbol=str(row.get("contractSymbol", "")),
     )
 
 
@@ -845,29 +890,43 @@ def default_leg_specs(
     if strategy == "Long Call":
         return [("call", 1, front_expiration, atm_call)]
     if strategy == "Short Call":
-        return [("call", -1, front_expiration, atm_call)]
+        return [
+            (
+                "call",
+                -1,
+                front_expiration,
+                nearest_delta(calls, DEFAULT_SHORT_DELTA),
+            )
+        ]
     if strategy == "Long Put":
         return [("put", 1, front_expiration, atm_put)]
     if strategy == "Short Put":
-        return [("put", -1, front_expiration, atm_put)]
+        return [
+            (
+                "put",
+                -1,
+                front_expiration,
+                nearest_delta(puts, DEFAULT_SHORT_DELTA),
+            )
+        ]
     if strategy == "Bull Call Debit Spread":
         return [
-            ("call", 1, front_expiration, atm_call),
-            ("call", -1, front_expiration, adjacent_strike(calls, atm_call, 1)),
+            ("call", 1, front_expiration, adjacent_strike(calls, atm_call, -1)),
+            ("call", -1, front_expiration, atm_call),
         ]
     if strategy == "Bear Call Credit Spread":
-        short_strike = nearest_delta(calls, 0.20)
+        short_strike = nearest_delta(calls, DEFAULT_SHORT_DELTA)
         return [
             ("call", -1, front_expiration, short_strike),
             ("call", 1, front_expiration, adjacent_strike(calls, short_strike, 1)),
         ]
     if strategy == "Bear Put Debit Spread":
         return [
-            ("put", 1, front_expiration, atm_put),
-            ("put", -1, front_expiration, adjacent_strike(puts, atm_put, -1)),
+            ("put", 1, front_expiration, adjacent_strike(puts, atm_put, 1)),
+            ("put", -1, front_expiration, atm_put),
         ]
     if strategy == "Bull Put Credit Spread":
-        short_strike = nearest_delta(puts, 0.20)
+        short_strike = nearest_delta(puts, DEFAULT_SHORT_DELTA)
         return [
             ("put", -1, front_expiration, short_strike),
             ("put", 1, front_expiration, adjacent_strike(puts, short_strike, -1)),
@@ -880,12 +939,22 @@ def default_leg_specs(
         ]
     if strategy == "Short Strangle":
         return [
-            ("put", -1, front_expiration, nearest_delta(puts, 0.20)),
-            ("call", -1, front_expiration, nearest_delta(calls, 0.20)),
+            (
+                "put",
+                -1,
+                front_expiration,
+                nearest_delta(puts, DEFAULT_SHORT_DELTA),
+            ),
+            (
+                "call",
+                -1,
+                front_expiration,
+                nearest_delta(calls, DEFAULT_SHORT_DELTA),
+            ),
         ]
     if strategy == "Iron Condor":
-        short_put = nearest_delta(puts, 0.20)
-        short_call = nearest_delta(calls, 0.20)
+        short_put = nearest_delta(puts, DEFAULT_SHORT_DELTA)
+        short_call = nearest_delta(calls, DEFAULT_SHORT_DELTA)
         return [
             ("put", 1, front_expiration, adjacent_strike(puts, short_put, -1)),
             ("put", -1, front_expiration, short_put),
@@ -898,22 +967,22 @@ def default_leg_specs(
     back_calls = chain_for_type(chains, back_expiration, "call")
     back_puts = chain_for_type(chains, back_expiration, "put")
     if strategy == "Call Calendar / Diagonal":
-        strike = nearest_delta(calls, 0.20)
+        strike = atm_call
         return [
             ("call", -1, front_expiration, strike),
             ("call", 1, back_expiration, nearest_strike(back_calls, strike)),
         ]
     if strategy == "Put Calendar / Diagonal":
-        strike = nearest_delta(puts, 0.20)
+        strike = atm_put
         return [
             ("put", -1, front_expiration, strike),
             ("put", 1, back_expiration, nearest_strike(back_puts, strike)),
         ]
     if strategy == "Double Calendar / Diagonal":
-        # Define the structure from the front-expiry 20-delta wings, then
+        # Define the structure from the front-expiry 40-delta wings, then
         # vertically align the back legs by strike whenever the listing allows.
-        put_strike = nearest_delta(puts, 0.20)
-        call_strike = nearest_delta(calls, 0.20)
+        put_strike = nearest_delta(puts, DEFAULT_DOUBLE_CALENDAR_DELTA)
+        call_strike = nearest_delta(calls, DEFAULT_DOUBLE_CALENDAR_DELTA)
         return [
             ("put", -1, front_expiration, put_strike),
             ("put", 1, back_expiration, nearest_strike(back_puts, put_strike)),
@@ -2353,9 +2422,8 @@ def main() -> None:
             st.code(str(exc))
         return
 
-    # Version the persisted setup because strike slots are positional and the
-    # double-diagonal display order changed in this release.
-    context_key = f"v3_{symbol}_{strategy}_{front_expiration}_{back_expiration}"
+    # Version persisted strike state when the default-selection policy changes.
+    context_key = f"v4_{symbol}_{strategy}_{front_expiration}_{back_expiration}"
     try:
         specifications = default_leg_specs(
             strategy, chains, front_expiration, back_expiration, market.spot
@@ -2382,7 +2450,7 @@ def main() -> None:
     with main_view:
         st.markdown(f"### {symbol} · {price_text(market.spot)}")
         st.markdown(f"#### {strategy}")
-        strike_settings = st.columns([1, 1, 0.55])
+        strike_settings = st.columns([1, 1, 0.55, 0.8])
         with strike_settings[0]:
             saved_view = query_text("strike_view", "List view")
             strike_view = st.radio(
@@ -2419,6 +2487,8 @@ def main() -> None:
                 help="Restore the strategy's initial strikes without changing IVs.",
                 use_container_width=True,
             )
+        with strike_settings[3]:
+            optionstrat_button = st.empty()
         columns = st.columns(min(len(default_legs), 4))
 
     persist_query_value("strike_view", strike_view)
@@ -2520,6 +2590,14 @@ def main() -> None:
     for index, leg in enumerate(selected_legs):
         persist_query_value(f"strike_{index}", f"{leg.strike:g}")
 
+    with optionstrat_button.container():
+        st.link_button(
+            "Load in OptionStrat",
+            optionstrat_url(symbol, strategy, selected_legs),
+            help="Open the currently selected expirations and strikes in OptionStrat.",
+            use_container_width=True,
+        )
+
     execution = execution_estimate(selected_legs)
     # The live strategy midpoint is the entry basis and updates automatically
     # whenever a strike or expiration changes.
@@ -2553,10 +2631,12 @@ def main() -> None:
         st.divider()
         if is_time_spread:
             range_column, control_mid, control_right, reset_iv_column = st.columns(
-                [0.8, 1, 1, 0.55]
+                [0.8, 1, 1, 0.55], vertical_alignment="bottom"
             )
         else:
-            range_column, control_mid, reset_iv_column = st.columns([0.8, 1, 0.55])
+            range_column, control_mid, reset_iv_column = st.columns(
+                [0.8, 1, 0.55], vertical_alignment="bottom"
+            )
             control_right = None
     with range_column:
         range_percent = st.number_input(
