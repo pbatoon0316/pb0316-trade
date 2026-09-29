@@ -19,13 +19,7 @@ METADATA_FILE = (
 )
 REQUEST_PAUSE_SECONDS = 0.15
 MAX_CONSECUTIVE_PROVIDER_FAILURES = 5
-GEX_DIVERGING_COLOR_SCALE = [
-    [0.0, "#67001f"],
-    [0.25, "#f4a582"],
-    [0.5, "#3f3f46"],
-    [0.75, "#92c5de"],
-    [1.0, "#053061"],
-]
+GEX_DIVERGING_COLOR_SCALE = px.colors.diverging.balance_r
 SECTOR_LABELS = {"Telecommunications": "Communication Services"}
 NON_EQUITY_PATTERNS = (
     r"\bEXCHANGE[- ]TRADED FUND\b",
@@ -46,6 +40,7 @@ DISPLAY_COLUMNS = {
     "market_cap_b": "Market Cap ($B)",
     "price": "Price",
     "daily_change_pct": "Day %",
+    "return_atr": "Return/ATR",
     "weekly_ema50": "Weekly EMA50",
     "net_gex": "Net GEX ($)",
     "normalized_gex_bps": "GEX / Market Cap (bp)",
@@ -159,17 +154,55 @@ def download_price_history(
     return combined, failures
 
 
-def ticker_close_series(data: pd.DataFrame, ticker: str) -> pd.Series:
+def ticker_price_series(data: pd.DataFrame, ticker: str, field: str) -> pd.Series:
     if data.empty or not isinstance(data.columns, pd.MultiIndex):
         return pd.Series(dtype=float)
-    candidates = (("Close", ticker), (ticker, "Close"))
+    candidates = ((field, ticker), (ticker, field))
     for column in candidates:
         if column in data.columns:
             return pd.to_numeric(data[column], errors="coerce").dropna().sort_index()
     return pd.Series(dtype=float)
 
 
-def latest_price_metrics(close: pd.Series) -> dict | None:
+def ticker_close_series(data: pd.DataFrame, ticker: str) -> pd.Series:
+    return ticker_price_series(data, ticker, "Close")
+
+
+def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series,
+               period: int = 14) -> pd.Series:
+    """Seed with the first 14 true ranges, then apply Wilder smoothing."""
+    prices = pd.concat({"high": high, "low": low, "close": close}, axis=1).sort_index()
+    previous_close = prices["close"].shift(1)
+    true_range = pd.concat([
+        prices["high"] - prices["low"],
+        (prices["high"] - previous_close).abs(),
+        (prices["low"] - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    valid = (np.isfinite(prices).all(axis=1)
+             & prices["high"].ge(prices["low"]))
+    true_range = true_range.where(valid)
+    atr = pd.Series(np.nan, index=prices.index, dtype=float)
+    seed = []
+    current_atr = np.nan
+    for index, value in true_range.items():
+        if pd.isna(value):
+            # Restart after missing OHLC rather than inventing a daily range.
+            seed = []
+            current_atr = np.nan
+            continue
+        if pd.isna(current_atr):
+            seed.append(float(value))
+            if len(seed) < period:
+                continue
+            current_atr = float(np.mean(seed))
+        else:
+            current_atr = (current_atr * (period - 1) + float(value)) / period
+        atr.loc[index] = current_atr
+    return atr
+
+
+def latest_price_metrics(close: pd.Series, high: pd.Series | None = None,
+                         low: pd.Series | None = None) -> dict | None:
     close = pd.to_numeric(close, errors="coerce").dropna().sort_index()
     if len(close) < 252:
         return None
@@ -183,7 +216,15 @@ def latest_price_metrics(close: pd.Series) -> dict | None:
         return None
     log_returns = np.log(close / close.shift(1))
     hv = log_returns.tail(21).std(ddof=1) * math.sqrt(252.0) * 100.0
+    previous_atr = np.nan
+    if high is not None and low is not None:
+        atr = wilder_atr(high.reindex(close.index), low.reindex(close.index), close)
+        previous_atr = float(atr.iloc[-2])
+    return_atr = ((current - previous) / previous_atr
+                  if np.isfinite(previous_atr) and previous_atr > 0 else np.nan)
     return {
+        "return_atr": return_atr,
+        "previous_atr_14": previous_atr,
         "price": current,
         "previous_close": previous,
         "daily_change_pct": (current / previous - 1.0) * 100.0,
@@ -198,7 +239,12 @@ def screen_price_history(
 ) -> pd.DataFrame:
     rows = []
     for record in metadata.to_dict("records"):
-        metrics = latest_price_metrics(ticker_close_series(history, record["ticker"]))
+        ticker = record["ticker"]
+        metrics = latest_price_metrics(
+            ticker_close_series(history, ticker),
+            ticker_price_series(history, ticker, "High"),
+            ticker_price_series(history, ticker, "Low"),
+        )
         if metrics is None or metrics["price"] <= metrics["weekly_ema50"]:
             continue
         change = metrics["daily_change_pct"]
@@ -610,7 +656,7 @@ def tradingview_html(ticker: str) -> str:
         "autosize": true,
         "height": "290",
         "symbol": "{ticker}",
-        "interval": "W",
+        "interval": "D",
         "timezone": "Etc/UTC",
         "theme": "light",
         "style": "1",
@@ -640,6 +686,10 @@ def display_results_table(results: pd.DataFrame) -> None:
             "Market Cap ($B)": st.column_config.NumberColumn(format="$%.1fB"),
             "Price": st.column_config.NumberColumn(format="$%.2f"),
             "Day %": st.column_config.NumberColumn(format="%+.2f%%"),
+            "Return/ATR": st.column_config.NumberColumn(
+                format="%+.2f×",
+                help="Signed latest-session price change / previous session's 14-day Wilder ATR.",
+            ),
             "Weekly EMA50": st.column_config.NumberColumn(format="$%.2f"),
             "Net GEX ($)": st.column_config.NumberColumn(format="$%.0f"),
             "GEX / Market Cap (bp)": st.column_config.NumberColumn(format="%+.3f"),
@@ -652,23 +702,30 @@ def display_results_table(results: pd.DataFrame) -> None:
 
 
 def render_chart_grid(results: pd.DataFrame, charts_per_page: int) -> tuple[int, int]:
-    tickers = results.sort_values("Market Cap", ascending=False)["ticker"].tolist()
+    ranked = results.sort_values(
+        "normalized_gex_bps", ascending=False, na_position="last", kind="stable"
+    )
+    tickers = ranked["ticker"].tolist()
     total_pages = max(1, math.ceil(len(tickers) / charts_per_page))
     current = min(
         max(int(st.session_state.get("market_gex_chart_page", 1)), 1), total_pages
     )
     st.session_state["market_gex_chart_page"] = current
     start = (current - 1) * charts_per_page
-    visible = tickers[start : start + charts_per_page]
+    visible = ranked.iloc[start : start + charts_per_page]
     st.caption(
         f"Showing charts {start + 1}-{min(start + charts_per_page, len(tickers))} of {len(tickers)}"
     )
     columns = st.columns(3)
-    for index, ticker in enumerate(visible):
+    for index, record in enumerate(visible.to_dict("records")):
+        ticker = record["ticker"]
+        gex = record.get("normalized_gex_bps", np.nan)
+        spread = record.get("iv_hv_spread_pct", np.nan)
+        gex_text = f"{gex:+.3f} bp" if pd.notna(gex) else "N/A"
+        spread_text = f"{spread:+.2f} pp" if pd.notna(spread) else "N/A"
         with columns[index % 3]:
             st.markdown(
-                f"{ticker} - [Finviz](https://finviz.com/quote.ashx?t={ticker}&p=d) "
-                f"[Profitviz](https://profitviz.com/{ticker})"
+                f"**{ticker}** · GEX/Market Cap: {gex_text} · IV-HV: {spread_text}"
             )
             components.html(tradingview_html(ticker), height=300)
     return current, total_pages
@@ -681,7 +738,6 @@ def main() -> None:
     industries = sorted(metadata["Industry"].unique().tolist())
 
     with st.sidebar:
-        st.header("Screen configuration")
         minimum_market_cap_b = st.number_input(
             "Minimum market cap ($B)", min_value=1.0, value=10.0, step=1.0
         )
@@ -773,6 +829,9 @@ def main() -> None:
             )
 
     results = st.session_state.get("market_gex_results", pd.DataFrame())
+    if not results.empty and "return_atr" not in results.columns:
+        results = results.assign(return_atr=np.nan)
+        st.info("Run combined screen again to calculate Return/ATR for these results.")
     statuses = st.session_state.get("market_gex_statuses", pd.DataFrame())
     stored_run_config = st.session_state.get("market_gex_run_config")
     if not results.empty and stored_run_config != current_run_config:
@@ -809,7 +868,6 @@ def main() -> None:
         else:
             st.plotly_chart(figure, width="stretch")
     with table_column:
-        st.markdown("#### Sortable results")
         display_results_table(display_results)
 
     _current_page, total_pages = render_chart_grid(
@@ -849,7 +907,9 @@ def main() -> None:
             "estimate by market cap and reports basis points. This is a positioning "
             "convention, not observed dealer inventory. Thirty-day IV interpolates "
             "ATM total variance; historical volatility uses 21 adjusted close-to-close "
-            "log returns annualized by √252. Yahoo data may be delayed or incomplete."
+            "log returns annualized by √252. Return/ATR is the signed latest-session "
+            "adjusted price change divided by the previous session's 14-day Wilder "
+            "ATR, using adjusted high, low, and close prices. Yahoo data may be delayed or incomplete."
         )
 
 

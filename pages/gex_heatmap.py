@@ -9,9 +9,9 @@ import yfinance as yf
 
 
 METRIC_COLUMNS = {
-    "Net GEX": "net_gex",
-    "Net Vanna Exposure": "net_vanna_exposure",
-    "Net Charm Exposure": "net_charm_exposure",
+    "Gamma": "net_gex",
+    "Vanna": "net_vanna_exposure",
+    "Charm": "net_charm_exposure",
 }
 
 
@@ -36,7 +36,7 @@ def reset_data_state():
         st.session_state.pop(key, None)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def get_available_expiries(ticker):
     stock = yf.Ticker(ticker)
     return list(stock.options)
@@ -460,8 +460,35 @@ def make_heatmap_fig(heatmap_df, metric, color_scale_mode, spot, ticker, snapsho
             zmid=0,
             hoverinfo="text",
             text=hover_text,
-            colorbar=dict(title=metric),
+            colorbar=dict(
+                title=dict(text=metric, side="top"),
+                x=1.01, xanchor="left", thickness=18,
+                tickformat="~s", xpad=8,
+            ),
         )
+    )
+
+    # White strike labels without a background.
+    # Annotations do not replace the heatmap's exposure/volume/OI tooltip.
+    strike_labels = []
+    for row_index, strike in enumerate(heatmap_df.index):
+        for column_index, expiry in enumerate(heatmap_df.columns):
+            if np.isfinite(values[row_index, column_index]):
+                strike_labels.append(dict(
+                    x=expiry, y=float(strike), text=f"{strike:g}",
+                    showarrow=False, font=dict(color="white", size=10),
+                    bgcolor="rgba(0,0,0,0)", borderpad=0,
+                    captureevents=False,
+                ))
+    fig.update_layout(annotations=strike_labels)
+
+    fig.update_xaxes(
+        type="category", categoryorder="array",
+        categoryarray=list(heatmap_df.columns),
+        tickmode="array", tickvals=list(heatmap_df.columns),
+        ticktext=[datetime.strptime(expiry, "%Y-%m-%d").strftime("%b %d %Y")
+                  for expiry in heatmap_df.columns],
+        tickangle=0,
     )
 
     fig.add_hline(
@@ -539,6 +566,116 @@ def make_total_exposure_by_strike_fig(
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def calculate_gamma_profile(raw_options_df, selected_expiries, spot_prices,
+                            risk_free_rate, as_of):
+    """Reprice every usable contract at each spot, with fixed IV and OI.
+
+    Match the existing heatmap's one-day minimum time to expiry and its
+    call-positive / put-negative dollar gamma per 1% spot-move convention.
+    Strike display limits must never filter the option universe here.
+    """
+    profile = np.full(len(spot_prices), np.nan, dtype=float)
+    needed = {"expiry", "strike", "impliedVolatility", "openInterest", "option_type"}
+    if raw_options_df is None or not needed.issubset(raw_options_df.columns):
+        return profile
+    options = raw_options_df[
+        raw_options_df["expiry"].isin(selected_expiries)
+    ].copy()
+    for column in ("strike", "impliedVolatility", "openInterest"):
+        options[column] = pd.to_numeric(options[column], errors="coerce")
+    expiry = pd.to_datetime(options["expiry"], errors="coerce")
+    dte = (expiry - pd.Timestamp(as_of)).dt.days
+    valid = (
+        np.isfinite(options[["strike", "impliedVolatility", "openInterest"]]).all(axis=1)
+        & options["strike"].gt(0)
+        & options["impliedVolatility"].gt(0)
+        & options["impliedVolatility"].le(5)
+        & options["openInterest"].gt(0)
+        & options["option_type"].isin(["call", "put"])
+        & dte.ge(0)
+    )
+    options = options.loc[valid]
+    if options.empty or not np.isfinite(risk_free_rate):
+        return profile
+    strike = options["strike"].to_numpy(dtype=float)
+    sigma = options["impliedVolatility"].to_numpy(dtype=float)
+    time_years = dte.loc[valid].clip(lower=1).to_numpy(dtype=float) / 365.0
+    signed_oi = options["openInterest"].to_numpy(dtype=float) * np.where(
+        options["option_type"].eq("call"), 1.0, -1.0
+    )
+    vol_time = sigma * np.sqrt(time_years)
+    # Bound temporary array sizes for large multi-expiry chains.
+    for start in range(0, len(spot_prices), 32):
+        spots = np.asarray(spot_prices[start:start + 32], dtype=float)[:, None]
+        d1 = (np.log(spots / strike) +
+              (risk_free_rate + 0.5 * sigma**2) * time_years) / vol_time
+        gamma = np.exp(-0.5 * d1**2) / (np.sqrt(2 * np.pi) * spots * vol_time)
+        profile[start:start + len(spots)] = (
+            gamma * signed_oi * 100 * spots**2 * 0.01
+        ).sum(axis=1)
+    return profile
+
+
+def add_gamma_profile(fig, raw_options_df, selected_expiries, risk_free_rate, spot):
+    """Overlay on the existing axes without changing vertical range or margins."""
+    if fig is None:
+        return
+    lower, upper = fig.layout.yaxis.range
+    prices = np.unique(np.append(np.linspace(lower, upper, 801), spot))
+    prices = prices[prices > 0]
+    exposure = calculate_gamma_profile(
+        raw_options_df, tuple(selected_expiries), prices,
+        risk_free_rate, date.today(),
+    )
+    if not np.isfinite(exposure).any():
+        return
+    fig.add_trace(go.Scatter(
+        x=exposure, y=prices, mode="lines", xaxis="x2",
+        line=dict(color="black", width=2.5),
+        name="Net Gamma vs. Spot", showlegend=False,
+        connectgaps=False,
+        hovertemplate=(
+            "Hypothetical spot: %{y:,.2f}<br>"
+            "Net Gamma: $%{x:,.0f} per 1% move<extra></extra>"
+        ),
+    ))
+    # Independent horizontal scale: the aggregate profile must not compress
+    # the per-strike bars. Both traces continue to share the same Y axis.
+    fig.update_layout(
+        title="Gamma by Strike & Net Gamma vs. Spot",
+        xaxis2=dict(
+            overlaying="x", anchor="y", side="top",
+            title=dict(text="Net Gamma vs. Spot ($ / 1% move)", standoff=4),
+            tickformat="~s", tickfont=dict(size=10),
+            showgrid=False, zeroline=False, zerolinecolor="black",
+            zerolinewidth=1, automargin=False, autorange=True,
+        ),
+    )
+
+
+def align_strike_plots(heatmap_fig, exposure_fig, heatmap_df, spot):
+    """Use the same pixel height and numeric strike range in both plots."""
+    strikes = np.sort(heatmap_df.index.to_numpy(dtype=float))
+    lower_padding = (strikes[1] - strikes[0]) / 2 if len(strikes) > 1 else 2.5
+    upper_padding = (strikes[-1] - strikes[-2]) / 2 if len(strikes) > 1 else 2.5
+    strike_range = [min(strikes[0] - lower_padding, spot),
+                    max(strikes[-1] + upper_padding, spot)]
+    # Only vertical margins must match. Reserve room for the heatmap colorbar
+    # explicitly because automatic margin expansion would break Y alignment.
+    for fig in (heatmap_fig, exposure_fig):
+        if fig is None:
+            continue
+        fig.update_layout(
+            height=720,
+            margin=dict(l=60, r=120 if fig is heatmap_fig else 40,
+                        t=70, b=90, autoexpand=False),
+        )
+        fig.update_yaxes(range=strike_range, autorange=False,
+                         domain=[0, 1], automargin=False)
+        fig.update_xaxes(automargin=False)
+
+
 def dataframe_to_csv(df):
     return df.to_csv(index=True).encode("utf-8")
 
@@ -558,12 +695,11 @@ def show_snapshot_metrics():
     )
 
 
-def render_data_download_buttons():
+def render_data_download_buttons(cols):
     raw_options_df = st.session_state.get("raw_options_df")
     greeks_df = st.session_state.get("greeks_df")
     heatmap_df = st.session_state.get("heatmap_df")
 
-    cols = st.columns(3)
     if raw_options_df is not None and not raw_options_df.empty:
         cols[0].download_button(
             "Download raw options CSV",
@@ -711,8 +847,6 @@ def main():
             lower_strike = None
             upper_strike = None
 
-        metric = st.selectbox("Metric", options=list(METRIC_COLUMNS.keys()), index=0)
-
         color_scale_mode = st.selectbox(
             "Color Scale Mode",
             options=["Auto max", "90th percentile", "95th Percentile", "99th Percentile"],
@@ -741,7 +875,15 @@ def main():
         st.info("Enter a ticker to begin.")
         return
 
-    show_snapshot_metrics()
+    # Reserve plot space above controls, but evaluate the selector first so both
+    # plots and the heatmap download use the selected metric on this same rerun.
+    plot_container = st.container()
+    control_cols = st.columns([1, 1, 1.2, 1])
+    metric = control_cols[0].selectbox(
+        "Metric", options=list(METRIC_COLUMNS.keys()), index=0,
+        label_visibility="collapsed", key="heatmap_metric",
+    )
+    st.session_state.pop("heatmap_df", None)
 
     greeks_df = st.session_state.get("greeks_df")
     if (
@@ -779,7 +921,14 @@ def main():
                 upper_strike,
                 st.session_state["spot"],
             )
-            heatmap_col, exposure_col = st.columns([3, 2])
+            align_strike_plots(fig, total_exposure_fig, heatmap_df, st.session_state["spot"])
+            if metric == "Gamma":
+                add_gamma_profile(
+                    total_exposure_fig, st.session_state["raw_options_df"],
+                    st.session_state["selected_expiries"],
+                    st.session_state["risk_free_rate"], st.session_state["spot"],
+                )
+            heatmap_col, exposure_col = plot_container.columns([3, 2])
 
             with heatmap_col:
                 st.plotly_chart(fig, use_container_width=True)
@@ -788,18 +937,23 @@ def main():
                 if total_exposure_fig is not None:
                     st.plotly_chart(total_exposure_fig, use_container_width=True)
 
-    render_data_download_buttons()
+    render_data_download_buttons(control_cols[1:])
     render_data_tables()
 
     st.code(
         "Exposure convention\n"
-        "Net GEX: dollar gamma for a 1% underlying move.\n"
+        "Gamma: dollar gamma for a 1% underlying move.\n"
         "Net Vanna Exposure: delta shares for a 1 volatility-point increase.\n"
         "Net Charm Exposure: delta shares gained (+) or lost (-) per calendar day.\n"
         "All net values use call exposure minus put exposure based on open interest.\n"
-        "This is a positioning convention, not observed dealer positioning.",
+        "This is a positioning convention, not observed dealer positioning.\n"
+        "Black Gamma curve: total net gamma repriced at hypothetical spot prices,\n"
+        "using all usable strikes in selected, loaded expiries with fixed IV and OI.\n"
+        "The curve uses the same 1-day minimum expiry time as the heatmap.",
         language=None,
     )
+
+    show_snapshot_metrics()
 
 
 if __name__ == "__main__":
