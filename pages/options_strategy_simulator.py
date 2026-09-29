@@ -6,23 +6,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
 import math
-from pathlib import Path
 import re
 import tempfile
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import GoodFriday
 import plotly.graph_objects as go
-from scipy.optimize import brentq
-from scipy.stats import norm
 import streamlit as st
 import yfinance as yf
-
+from pandas.tseries.holiday import GoodFriday
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 # yfinance 1.x uses a small SQLite cookie/time-zone cache. Its default user
 # cache directory can be read-only in hosted or sandboxed Streamlit sessions.
@@ -57,24 +56,32 @@ LOW_OPEN_INTEREST = 20
 LOW_VOLUME = 5
 
 SINGLE_EXPIRY_STRATEGIES = [
-    "Long Call",
-    "Short Call",
-    "Long Put",
-    "Short Put",
-    "Bull Call Debit Spread",
-    "Bear Call Credit Spread",
-    "Bear Put Debit Spread",
-    "Bull Put Credit Spread",
-    "Short Straddle",
-    "Short Strangle",
+    "Single Option",
+    "Vertical",
+    "Short Straddle / Strangle",
     "Iron Condor",
+    "Butterfly",
 ]
 TIME_SPREAD_STRATEGIES = [
-    "Call Calendar / Diagonal",
-    "Put Calendar / Diagonal",
+    "Calendar / Diagonal",
     "Double Calendar / Diagonal",
+    "Triple Calendar",
 ]
 ALL_STRATEGIES = SINGLE_EXPIRY_STRATEGIES + TIME_SPREAD_STRATEGIES
+LEGACY_STRATEGY_FAMILIES = {
+    "Long Call": "Single Option",
+    "Short Call": "Single Option",
+    "Long Put": "Single Option",
+    "Short Put": "Single Option",
+    "Bull Call Debit Spread": "Vertical",
+    "Bear Call Credit Spread": "Vertical",
+    "Bear Put Debit Spread": "Vertical",
+    "Bull Put Credit Spread": "Vertical",
+    "Short Straddle": "Short Straddle / Strangle",
+    "Short Strangle": "Short Straddle / Strangle",
+    "Call Calendar / Diagonal": "Calendar / Diagonal",
+    "Put Calendar / Diagonal": "Calendar / Diagonal",
+}
 OPTIONSTRAT_STRATEGY_SLUGS = {
     "Long Call": "long-call",
     "Short Call": "short-call",
@@ -90,6 +97,9 @@ OPTIONSTRAT_STRATEGY_SLUGS = {
     "Call Calendar / Diagonal": "calendar-call-spread",
     "Put Calendar / Diagonal": "calendar-put-spread",
     "Double Calendar / Diagonal": "double-calendar",
+    "Long Call Butterfly": "long-call-butterfly",
+    "Long Put Butterfly": "long-put-butterfly",
+    "Triple Calendar": "custom",
 }
 
 
@@ -120,7 +130,8 @@ class OptionLeg:
 
     @property
     def label(self) -> str:
-        return f"{self.side_label} {self.option_type.title()}"
+        quantity_label = f" ×{self.quantity}" if self.quantity > 1 else ""
+        return f"{self.side_label} {self.option_type.title()}{quantity_label}"
 
 
 @dataclass(frozen=True)
@@ -251,7 +262,8 @@ def optionstrat_url(symbol: str, strategy: str, legs: Sequence[OptionLeg]) -> st
                 f".{fallback_root}{leg.expiration:%y%m%d}{call_put}{leg.strike:g}"
             )
         signed_symbol = f"-{option_symbol}" if leg.side < 0 else option_symbol
-        tokens.extend([signed_symbol] * leg.quantity)
+        quantity_suffix = f"x{leg.quantity}" if leg.quantity > 1 else ""
+        tokens.append(f"{signed_symbol}{quantity_suffix}")
 
     return f"https://optionstrat.com/build/{slug}/{underlying}/" + ",".join(tokens)
 
@@ -583,18 +595,20 @@ def solve_implied_volatility(
     try:
         return float(
             brentq(
-                lambda sigma: float(
-                    bsm_price(
-                        spot,
-                        strike,
-                        time_years,
-                        rate,
-                        dividend_yield,
-                        sigma,
-                        option_type,
+                lambda sigma: (
+                    float(
+                        bsm_price(
+                            spot,
+                            strike,
+                            time_years,
+                            rate,
+                            dividend_yield,
+                            sigma,
+                            option_type,
+                        )
                     )
-                )
-                - observed_price,
+                    - observed_price
+                ),
                 MIN_VOLATILITY,
                 MAX_VOLATILITY,
                 xtol=1e-8,
@@ -820,12 +834,13 @@ def leg_from_chain(
     side: int,
     expiration: date,
     strike: float,
+    quantity: int = 1,
 ) -> OptionLeg:
     row = row_for_strike(chain_for_type(chains, expiration, option_type), strike)
     return OptionLeg(
         option_type=option_type,
         side=side,
-        quantity=1,
+        quantity=quantity,
         expiration=expiration,
         strike=float(row["strike"]),
         bid=finite_float(row["bid"]),
@@ -881,63 +896,36 @@ def default_leg_specs(
     front_expiration: date,
     back_expiration: date | None,
     spot: float,
+    option_type: str = "call",
+    position_side: int = 1,
+    center_option_type: str = "call",
 ) -> list[tuple[str, int, date, float]]:
     calls = chain_for_type(chains, front_expiration, "call")
     puts = chain_for_type(chains, front_expiration, "put")
     atm_call = nearest_atm(calls, spot)
     atm_put = nearest_atm(puts, spot)
 
-    if strategy == "Long Call":
-        return [("call", 1, front_expiration, atm_call)]
-    if strategy == "Short Call":
+    if strategy == "Single Option":
+        frame = calls if option_type == "call" else puts
+        atm = atm_call if option_type == "call" else atm_put
+        strike = nearest_delta(frame, DEFAULT_SHORT_DELTA) if position_side < 0 else atm
+        return [(option_type, position_side, front_expiration, strike)]
+    if strategy == "Vertical":
+        frame = calls if option_type == "call" else puts
+        atm = atm_call if option_type == "call" else atm_put
+        long_direction = -1 if option_type == "call" else 1
         return [
             (
-                "call",
-                -1,
+                option_type,
+                1,
                 front_expiration,
-                nearest_delta(calls, DEFAULT_SHORT_DELTA),
-            )
+                adjacent_strike(frame, atm, long_direction),
+            ),
+            (option_type, -1, front_expiration, atm),
         ]
-    if strategy == "Long Put":
-        return [("put", 1, front_expiration, atm_put)]
-    if strategy == "Short Put":
-        return [
-            (
-                "put",
-                -1,
-                front_expiration,
-                nearest_delta(puts, DEFAULT_SHORT_DELTA),
-            )
-        ]
-    if strategy == "Bull Call Debit Spread":
-        return [
-            ("call", 1, front_expiration, adjacent_strike(calls, atm_call, -1)),
-            ("call", -1, front_expiration, atm_call),
-        ]
-    if strategy == "Bear Call Credit Spread":
-        short_strike = nearest_delta(calls, DEFAULT_SHORT_DELTA)
-        return [
-            ("call", -1, front_expiration, short_strike),
-            ("call", 1, front_expiration, adjacent_strike(calls, short_strike, 1)),
-        ]
-    if strategy == "Bear Put Debit Spread":
-        return [
-            ("put", 1, front_expiration, adjacent_strike(puts, atm_put, 1)),
-            ("put", -1, front_expiration, atm_put),
-        ]
-    if strategy == "Bull Put Credit Spread":
-        short_strike = nearest_delta(puts, DEFAULT_SHORT_DELTA)
-        return [
-            ("put", -1, front_expiration, short_strike),
-            ("put", 1, front_expiration, adjacent_strike(puts, short_strike, -1)),
-        ]
-    if strategy == "Short Straddle":
-        shared = nearest_atm(calls, spot)
-        return [
-            ("put", -1, front_expiration, shared),
-            ("call", -1, front_expiration, shared),
-        ]
-    if strategy == "Short Strangle":
+    if strategy == "Short Straddle / Strangle":
+        # The family defaults to a 30-delta strangle. Selecting matching
+        # strikes turns the same two-leg topology into a true short straddle.
         return [
             (
                 "put",
@@ -961,22 +949,33 @@ def default_leg_specs(
             ("call", -1, front_expiration, short_call),
             ("call", 1, front_expiration, adjacent_strike(calls, short_call, 1)),
         ]
+    if strategy == "Butterfly":
+        frame = calls if option_type == "call" else puts
+        body = atm_call if option_type == "call" else atm_put
+        otm_wing = nearest_delta(frame, DEFAULT_SHORT_DELTA)
+        wing_width = abs(otm_wing - body)
+        opposite_target = (
+            body - wing_width if option_type == "call" else body + wing_width
+        )
+        opposite_wing = nearest_strike(frame, opposite_target)
+        lower_wing, upper_wing = sorted((otm_wing, opposite_wing))
+        return [
+            (option_type, 1, front_expiration, lower_wing),
+            (option_type, -1, front_expiration, body),
+            (option_type, 1, front_expiration, upper_wing),
+        ]
 
     if back_expiration is None:
         raise ValueError("A back expiration is required for a calendar or diagonal.")
     back_calls = chain_for_type(chains, back_expiration, "call")
     back_puts = chain_for_type(chains, back_expiration, "put")
-    if strategy == "Call Calendar / Diagonal":
-        strike = atm_call
+    if strategy == "Calendar / Diagonal":
+        frame = calls if option_type == "call" else puts
+        back_frame = back_calls if option_type == "call" else back_puts
+        strike = nearest_atm(frame, spot)
         return [
-            ("call", -1, front_expiration, strike),
-            ("call", 1, back_expiration, nearest_strike(back_calls, strike)),
-        ]
-    if strategy == "Put Calendar / Diagonal":
-        strike = atm_put
-        return [
-            ("put", -1, front_expiration, strike),
-            ("put", 1, back_expiration, nearest_strike(back_puts, strike)),
+            (option_type, -1, front_expiration, strike),
+            (option_type, 1, back_expiration, nearest_strike(back_frame, strike)),
         ]
     if strategy == "Double Calendar / Diagonal":
         # Define the structure from the front-expiry 40-delta wings, then
@@ -989,7 +988,79 @@ def default_leg_specs(
             ("call", -1, front_expiration, call_strike),
             ("call", 1, back_expiration, nearest_strike(back_calls, call_strike)),
         ]
+    if strategy == "Triple Calendar":
+        put_strike = nearest_delta(puts, 0.20)
+        call_strike = nearest_delta(calls, 0.20)
+        center_frame = calls if center_option_type == "call" else puts
+        center_back_frame = back_calls if center_option_type == "call" else back_puts
+        center_strike = nearest_atm(center_frame, spot)
+        return [
+            ("put", -1, front_expiration, put_strike),
+            ("put", 1, back_expiration, nearest_strike(back_puts, put_strike)),
+            (center_option_type, -1, front_expiration, center_strike),
+            (
+                center_option_type,
+                1,
+                back_expiration,
+                nearest_strike(center_back_frame, center_strike),
+            ),
+            ("call", -1, front_expiration, call_strike),
+            ("call", 1, back_expiration, nearest_strike(back_calls, call_strike)),
+        ]
     raise ValueError(f"Unsupported strategy: {strategy}")
+
+
+def default_leg_quantity(strategy: str, leg_index: int) -> int:
+    """Return the contract count represented by one strike selector."""
+    return 2 if strategy == "Butterfly" and leg_index == 1 else 1
+
+
+def paired_leg_indices(strategy: str) -> dict[int, int]:
+    """Map each calendar leg to its explicit same-strike partner."""
+    pair_count = {
+        "Calendar / Diagonal": 1,
+        "Double Calendar / Diagonal": 2,
+        "Triple Calendar": 3,
+    }.get(strategy, 0)
+    pairs: dict[int, int] = {}
+    for pair_index in range(pair_count):
+        short_index = pair_index * 2
+        long_index = short_index + 1
+        pairs[short_index] = long_index
+        pairs[long_index] = short_index
+    return pairs
+
+
+def resolved_strategy_name(strategy: str, legs: Sequence[OptionLeg]) -> str:
+    """Resolve a consolidated UI family to its familiar strategy name."""
+    if strategy == "Single Option" and legs:
+        return f"{legs[0].side_label} {legs[0].option_type.title()}"
+    if strategy == "Vertical" and len(legs) >= 2:
+        option_type = legs[0].option_type
+        long_leg = next((leg for leg in legs if leg.side > 0), legs[0])
+        short_leg = next((leg for leg in legs if leg.side < 0), legs[-1])
+        if option_type == "call":
+            return (
+                "Bull Call Debit Spread"
+                if long_leg.strike <= short_leg.strike
+                else "Bear Call Credit Spread"
+            )
+        return (
+            "Bear Put Debit Spread"
+            if long_leg.strike >= short_leg.strike
+            else "Bull Put Credit Spread"
+        )
+    if strategy == "Short Straddle / Strangle" and len(legs) >= 2:
+        return (
+            "Short Straddle"
+            if math.isclose(legs[0].strike, legs[1].strike, abs_tol=1e-9)
+            else "Short Strangle"
+        )
+    if strategy == "Butterfly" and legs:
+        return f"Long {legs[0].option_type.title()} Butterfly"
+    if strategy == "Calendar / Diagonal" and legs:
+        return f"{legs[0].option_type.title()} Calendar / Diagonal"
+    return strategy
 
 
 # ============================================================
@@ -1422,7 +1493,7 @@ def risk_summary(
 ) -> tuple[str, str, str]:
     """Return max profit, max loss and the scope label."""
     entry_dollars = entry_per_share * CONTRACT_MULTIPLIER
-    if strategy in TIME_SPREAD_STRATEGIES:
+    if len({leg.expiration for leg in legs}) > 1:
         strikes = [leg.strike for leg in legs]
         high = max(strikes) * 2.5
         grid = np.linspace(0.01, high, 2401)
@@ -2237,18 +2308,77 @@ def main() -> None:
         if load_clicked or "loaded_symbol" not in st.session_state:
             st.session_state["loaded_symbol"] = requested_symbol or persisted_symbol
         symbol = str(st.session_state["loaded_symbol"])
-        persisted_strategy = query_text("strategy", "Short Strangle")
+        persisted_raw_strategy = query_text("strategy", "Short Straddle / Strangle")
+        persisted_strategy = LEGACY_STRATEGY_FAMILIES.get(
+            persisted_raw_strategy, persisted_raw_strategy
+        )
         strategy_index = (
             ALL_STRATEGIES.index(persisted_strategy)
             if persisted_strategy in ALL_STRATEGIES
-            else ALL_STRATEGIES.index("Short Strangle")
+            else ALL_STRATEGIES.index("Short Straddle / Strangle")
         )
+        if st.session_state.get("strategy_selection") not in ALL_STRATEGIES:
+            st.session_state["strategy_selection"] = persisted_strategy
         strategy = st.selectbox(
             "Strategy",
             ALL_STRATEGIES,
             index=strategy_index,
             key="strategy_selection",
         )
+
+        legacy_option_type = "put" if "Put" in persisted_raw_strategy else "call"
+        saved_option_type = query_text("option_type", legacy_option_type).lower()
+        option_type = (
+            saved_option_type if saved_option_type in {"call", "put"} else "call"
+        )
+        saved_position = query_text(
+            "position_side",
+            "Short" if persisted_raw_strategy.startswith("Short ") else "Long",
+        )
+        position_side = -1 if saved_position == "Short" else 1
+        saved_center_type = query_text("center_option_type", "call").lower()
+        center_option_type = (
+            saved_center_type if saved_center_type in {"call", "put"} else "call"
+        )
+
+        if strategy == "Single Option":
+            option_type = st.radio(
+                "Option type",
+                ["call", "put"],
+                index=0 if option_type == "call" else 1,
+                format_func=str.title,
+                horizontal=True,
+                key="single_option_type",
+            )
+            position_label = st.radio(
+                "Position",
+                ["Long", "Short"],
+                index=0 if position_side > 0 else 1,
+                horizontal=True,
+                key="single_position_side",
+            )
+            position_side = 1 if position_label == "Long" else -1
+        elif strategy in {"Vertical", "Butterfly", "Calendar / Diagonal"}:
+            option_type = st.radio(
+                "Option type",
+                ["call", "put"],
+                index=0 if option_type == "call" else 1,
+                format_func=str.title,
+                horizontal=True,
+                key=(
+                    f"{strategy.lower().replace(' ', '_').replace('/', '_')}"
+                    "_option_type"
+                ),
+            )
+        elif strategy == "Triple Calendar":
+            center_option_type = st.radio(
+                "ATM center type",
+                ["call", "put"],
+                index=0 if center_option_type == "call" else 1,
+                format_func=str.title,
+                horizontal=True,
+                key="triple_calendar_center_type",
+            )
         with st.expander("Advanced settings"):
             saved_iv_source = query_text("iv_source", "Yahoo")
             iv_source = st.selectbox(
@@ -2286,6 +2416,9 @@ def main() -> None:
     persist_query_value("ticker", symbol)
     persist_query_value("strategy", strategy)
     persist_query_value("iv_source", iv_source)
+    persist_query_value("option_type", option_type)
+    persist_query_value("position_side", "Long" if position_side > 0 else "Short")
+    persist_query_value("center_option_type", center_option_type)
     try:
         market_ready_key = f"market_ready_{symbol}"
         if st.session_state.get(market_ready_key):
@@ -2423,14 +2556,33 @@ def main() -> None:
         return
 
     # Version persisted strike state when the default-selection policy changes.
-    context_key = f"v4_{symbol}_{strategy}_{front_expiration}_{back_expiration}"
+    context_key = (
+        f"v5_{symbol}_{strategy}_{option_type}_{position_side}_"
+        f"{center_option_type}_{front_expiration}_{back_expiration}"
+    )
     try:
         specifications = default_leg_specs(
-            strategy, chains, front_expiration, back_expiration, market.spot
+            strategy,
+            chains,
+            front_expiration,
+            back_expiration,
+            market.spot,
+            option_type=option_type,
+            position_side=position_side,
+            center_option_type=center_option_type,
         )
         default_legs = [
-            leg_from_chain(chains, option_type, side, expiration, strike)
-            for option_type, side, expiration, strike in specifications
+            leg_from_chain(
+                chains,
+                leg_option_type,
+                side,
+                expiration,
+                strike,
+                quantity=default_leg_quantity(strategy, index),
+            )
+            for index, (leg_option_type, side, expiration, strike) in enumerate(
+                specifications
+            )
         ]
     except Exception as exc:
         st.warning("There are not enough usable strikes to initialize this strategy.")
@@ -2447,6 +2599,7 @@ def main() -> None:
         metrics_view = None
 
     anchor_widget_key = f"anchor_pairs_{context_key}"
+    anchor_targets = paired_leg_indices(strategy)
     with main_view:
         st.markdown(f"### {symbol} · {price_text(market.spot)}")
         st.markdown(f"#### {strategy}")
@@ -2502,16 +2655,7 @@ def main() -> None:
         for source_index, source_leg in enumerate(default_legs):
             if source_leg.side >= 0:
                 continue
-            target_index = next(
-                (
-                    candidate_index
-                    for candidate_index, candidate in enumerate(default_legs)
-                    if candidate_index != source_index
-                    and candidate.option_type == source_leg.option_type
-                    and candidate.side > 0
-                ),
-                None,
-            )
+            target_index = anchor_targets.get(source_index)
             if target_index is None:
                 continue
             source_value = float(
@@ -2544,16 +2688,7 @@ def main() -> None:
     for index, leg in enumerate(default_legs):
         with columns[index % len(columns)]:
             frame = chain_for_type(chains, leg.expiration, leg.option_type)
-            target_index = next(
-                (
-                    candidate_index
-                    for candidate_index, candidate in enumerate(default_legs)
-                    if candidate_index != index
-                    and candidate.option_type == leg.option_type
-                    and candidate.side == -leg.side
-                ),
-                None,
-            )
+            target_index = anchor_targets.get(index)
             target_strikes: tuple[float, ...] = ()
             if target_index is not None:
                 target_leg = default_legs[target_index]
@@ -2582,7 +2717,12 @@ def main() -> None:
             )
             selected_legs.append(
                 leg_from_chain(
-                    chains, leg.option_type, leg.side, leg.expiration, selected_strike
+                    chains,
+                    leg.option_type,
+                    leg.side,
+                    leg.expiration,
+                    selected_strike,
+                    quantity=leg.quantity,
                 )
             )
 
@@ -2590,10 +2730,11 @@ def main() -> None:
     for index, leg in enumerate(selected_legs):
         persist_query_value(f"strike_{index}", f"{leg.strike:g}")
 
+    resolved_strategy = resolved_strategy_name(strategy, selected_legs)
     with optionstrat_button.container():
         st.link_button(
             "Load in OptionStrat",
-            optionstrat_url(symbol, strategy, selected_legs),
+            optionstrat_url(symbol, resolved_strategy, selected_legs),
             help="Open the currently selected expirations and strikes in OptionStrat.",
             use_container_width=True,
         )
@@ -2782,7 +2923,7 @@ def main() -> None:
         0.0,
     )
     advanced_metrics = calculate_advanced_metrics(
-        strategy=strategy,
+        strategy=resolved_strategy,
         legs=selected_legs,
         spot=market.spot,
         entry_per_share=entry_per_share,
@@ -2796,7 +2937,12 @@ def main() -> None:
         entry_greeks=entry_greeks,
     )
     max_profit, max_loss, _ = risk_summary(
-        strategy, selected_legs, entry_per_share, rate, dividend_yield, front_expiration
+        resolved_strategy,
+        selected_legs,
+        entry_per_share,
+        rate,
+        dividend_yield,
+        front_expiration,
     )
     if metrics_view is not None:
         with metrics_view:
